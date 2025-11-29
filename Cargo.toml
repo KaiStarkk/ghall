@@ -1,0 +1,32 @@
+[package]
+name = "ghall"
+version = "0.1.0"
+edition = "2021"
+description = "A commander-style TUI for managing git repositories across GitHub and local"
+authors = ["Kieran Hannigan <overyonderstudios@gmail.com>"]
+license = "MIT"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization (for gh CLI JSON output)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Directory walking
+walkdir = "2"
+
+# Path expansion
+shellexpand = "3"

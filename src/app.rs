@@ -1,0 +1,606 @@
+use crate::git::RepoStatus;
+use crate::{git, github, local};
+use anyhow::Result;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewMode {
+    Repos,
+    Gists,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputMode {
+    Normal,
+    Commit,
+    ConfirmDelete,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PopupType {
+    Help,
+    DirtyFiles,
+    Diff,
+}
+
+#[derive(Debug, Clone)]
+pub struct Popup {
+    pub popup_type: PopupType,
+    pub scroll: usize,
+    pub content: Vec<String>,
+}
+
+impl Popup {
+    pub fn new(popup_type: PopupType, content: Vec<String>) -> Self {
+        Self {
+            popup_type,
+            scroll: 0,
+            content,
+        }
+    }
+
+    pub fn scroll_down(&mut self, visible_lines: usize) {
+        let max_scroll = self.content.len().saturating_sub(visible_lines);
+        self.scroll = (self.scroll + 1).min(max_scroll);
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoRow {
+    // Identity
+    pub id: String,
+
+    // GitHub info (None if local-only)
+    pub owner: Option<String>,
+    pub name: String,
+    pub github_url: Option<String>,
+    pub ssh_url: Option<String>,
+    pub is_fork: bool,
+    pub fork_parent: Option<String>,
+    pub is_private: bool,
+
+    // Local info (None if remote-only)
+    pub local_path: Option<String>,
+    pub git_status: Option<RepoStatus>,
+}
+
+impl RepoRow {
+    pub fn has_local(&self) -> bool {
+        self.local_path.is_some()
+    }
+
+    pub fn has_remote(&self) -> bool {
+        self.github_url.is_some()
+    }
+
+    pub fn is_local_only(&self) -> bool {
+        self.local_path.is_some() && self.github_url.is_none()
+    }
+
+    pub fn is_remote_only(&self) -> bool {
+        self.github_url.is_some() && self.local_path.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GistRow {
+    pub id: String,
+    pub description: String,
+    pub is_public: bool,
+    pub file_names: Vec<String>,
+    pub html_url: String,
+    pub local_path: Option<String>,
+}
+
+pub struct App {
+    pub local_root: String,
+    pub view_mode: ViewMode,
+
+    // Data
+    pub repos: Vec<RepoRow>,
+    pub gists: Vec<GistRow>,
+
+    // Selection
+    pub selected: usize,
+    pub scroll_offset: usize,
+
+    // UI state
+    pub status_message: Option<String>,
+    pub input_mode: InputMode,
+    pub popup: Option<Popup>,
+    pub input_buffer: String,
+    pub confirm_buffer: String,
+}
+
+impl App {
+    pub async fn new(local_root: String) -> Result<Self> {
+        let mut app = Self {
+            local_root,
+            view_mode: ViewMode::Repos,
+            repos: Vec::new(),
+            gists: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+            status_message: Some("Loading...".to_string()),
+            input_mode: InputMode::Normal,
+            popup: None,
+            input_buffer: String::new(),
+            confirm_buffer: String::new(),
+        };
+
+        app.refresh().await?;
+        app.status_message = None;
+
+        Ok(app)
+    }
+
+    pub async fn refresh(&mut self) -> Result<()> {
+        self.status_message = Some("Refreshing...".to_string());
+
+        // Fetch GitHub repos via GraphQL
+        let github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
+
+        // Discover local repos
+        let local_repos = local::discover_repos(&self.local_root).await?;
+
+        // Merge into unified list
+        self.repos = merge_repos(github_repos, local_repos);
+
+        // Fetch gists
+        self.gists = github::fetch_gists_as_rows(&self.local_root).await.unwrap_or_default();
+
+        // Reset selection if out of bounds
+        let max = self.current_list_len().saturating_sub(1);
+        if self.selected > max {
+            self.selected = max;
+        }
+
+        self.status_message = None;
+        Ok(())
+    }
+
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Repos => ViewMode::Gists,
+            ViewMode::Gists => ViewMode::Repos,
+        };
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn current_list_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Repos => self.repos.len(),
+            ViewMode::Gists => self.gists.len(),
+        }
+    }
+
+    pub fn next(&mut self) {
+        let count = self.current_list_len();
+        if count > 0 {
+            self.selected = (self.selected + 1).min(count - 1);
+        }
+    }
+
+    pub fn previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        if let Some(ref mut popup) = self.popup {
+            popup.scroll_down(20);
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        if let Some(ref mut popup) = self.popup {
+            popup.scroll_up();
+        }
+    }
+
+    pub fn get_selected_repo(&self) -> Option<&RepoRow> {
+        if self.view_mode == ViewMode::Repos {
+            self.repos.get(self.selected)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_selected_gist(&self) -> Option<&GistRow> {
+        if self.view_mode == ViewMode::Gists {
+            self.gists.get(self.selected)
+        } else {
+            None
+        }
+    }
+
+    pub fn toggle_help(&mut self) {
+        if self.popup.is_some() {
+            self.popup = None;
+        } else {
+            self.popup = Some(Popup::new(PopupType::Help, get_help_content(&self.view_mode)));
+        }
+    }
+
+    pub fn close_popup(&mut self) {
+        self.popup = None;
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.confirm_buffer.clear();
+    }
+
+    // Git operations for selected repo
+    pub async fn fetch_selected(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            self.status_message = Some(format!("Fetching {}...", name));
+            git::fetch(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn pull_selected(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            self.status_message = Some(format!("Pulling {}...", name));
+            git::pull(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn push_selected(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            self.status_message = Some(format!("Pushing {}...", name));
+            git::push(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn sync_selected(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            self.status_message = Some(format!("Syncing {}...", name));
+            git::fetch(&path).await?;
+            git::pull(&path).await?;
+            git::push(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn clone_selected(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().and_then(|r| {
+            if r.is_remote_only() {
+                r.ssh_url.clone().map(|url| (r.name.clone(), url))
+            } else {
+                None
+            }
+        });
+        if let Some((name, url)) = info {
+            let clone_path = get_ghq_path(&self.local_root, &url);
+            self.status_message = Some(format!("Cloning {}...", name));
+            git::clone(&url, &clone_path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn show_dirty_files(&mut self) -> Result<()> {
+        let path = self.get_selected_repo().and_then(|r| r.local_path.clone());
+        if let Some(path) = path {
+            let files = git::get_dirty_files(&path).await?;
+            if !files.is_empty() {
+                self.popup = Some(Popup::new(PopupType::DirtyFiles, files));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn show_diff(&mut self) -> Result<()> {
+        let path = self.get_selected_repo().and_then(|r| r.local_path.clone());
+        if let Some(path) = path {
+            let diff = git::get_diff(&path).await?;
+            let lines: Vec<String> = diff.lines().map(|s| s.to_string()).collect();
+            if !lines.is_empty() {
+                self.popup = Some(Popup::new(PopupType::Diff, lines));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_commit(&mut self) {
+        let is_dirty = self.get_selected_repo()
+            .and_then(|r| r.git_status.as_ref())
+            .map(|s| s.is_dirty())
+            .unwrap_or(false);
+        if is_dirty {
+            self.input_mode = InputMode::Commit;
+            self.input_buffer = "fixup: from ghall".to_string();
+        }
+    }
+
+    pub async fn commit_and_push(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            let message = if self.input_buffer.is_empty() {
+                "fixup: from ghall".to_string()
+            } else {
+                self.input_buffer.clone()
+            };
+
+            self.status_message = Some(format!("Committing {}...", name));
+            git::add_all(&path).await?;
+            git::commit(&path, &message).await?;
+            git::push(&path).await?;
+
+            self.close_popup();
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub fn start_delete_confirm(&mut self) {
+        let can_delete = self.get_selected_repo()
+            .map(|r| r.has_local() && r.git_status.as_ref().map(|s| s.is_synced()).unwrap_or(false))
+            .unwrap_or(false);
+        if can_delete {
+            self.input_mode = InputMode::ConfirmDelete;
+            self.confirm_buffer.clear();
+        }
+    }
+
+    pub async fn delete_local_repo(&mut self) -> Result<()> {
+        if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
+            let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+            if let Some((name, Some(path))) = info {
+                self.status_message = Some(format!("Deleting {}...", name));
+                tokio::fs::remove_dir_all(&path).await?;
+                self.close_popup();
+                self.refresh().await?;
+            }
+        } else {
+            self.close_popup();
+        }
+        Ok(())
+    }
+
+    pub async fn create_github_repo(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().and_then(|r| {
+            if r.is_local_only() {
+                r.local_path.clone().map(|p| (r.name.clone(), p))
+            } else {
+                None
+            }
+        });
+        if let Some((name, path)) = info {
+            self.status_message = Some(format!("Creating GitHub repo for {}...", name));
+            github::create_repo(&name, &path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    // Gist operations
+    pub async fn clone_gist(&mut self) -> Result<()> {
+        let info = self.get_selected_gist().and_then(|g| {
+            if g.local_path.is_none() {
+                Some(g.id.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(id) = info {
+            let clone_path = format!("{}/gists/{}", self.local_root, id);
+            let display_id = &id[..8.min(id.len())];
+            self.status_message = Some(format!("Cloning gist {}...", display_id));
+            github::clone_gist(&id, &clone_path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub fn start_gist_delete_confirm(&mut self) {
+        if self.get_selected_gist().is_some() {
+            self.input_mode = InputMode::ConfirmDelete;
+            self.confirm_buffer.clear();
+        }
+    }
+
+    pub async fn delete_gist(&mut self) -> Result<()> {
+        if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
+            let id = self.get_selected_gist().map(|g| g.id.clone());
+            if let Some(id) = id {
+                self.status_message = Some("Deleting gist...".to_string());
+                github::delete_gist(&id).await?;
+                self.close_popup();
+                self.refresh().await?;
+            }
+        } else {
+            self.close_popup();
+        }
+        Ok(())
+    }
+
+    pub fn handle_char(&mut self, c: char) {
+        match self.input_mode {
+            InputMode::Commit => {
+                self.input_buffer.push(c);
+            }
+            InputMode::ConfirmDelete => {
+                self.confirm_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_backspace(&mut self) {
+        match self.input_mode {
+            InputMode::Commit => {
+                self.input_buffer.pop();
+            }
+            InputMode::ConfirmDelete => {
+                self.confirm_buffer.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn normalize_github_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches(".git")
+        .replace("git@github.com:", "https://github.com/")
+        .to_lowercase()
+}
+
+fn get_ghq_path(root: &str, url: &str) -> String {
+    let normalized = normalize_github_url(url);
+    let path = normalized
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    format!("{}/{}", root, path)
+}
+
+fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local::LocalRepo>) -> Vec<RepoRow> {
+    let mut result: Vec<RepoRow> = Vec::new();
+    let mut local_by_url: HashMap<String, local::LocalRepo> = HashMap::new();
+
+    // Index local repos by normalized URL
+    for repo in local_repos {
+        if let Some(ref url) = repo.remote_url {
+            let normalized = normalize_github_url(url);
+            local_by_url.insert(normalized, repo);
+        } else {
+            // Local-only repo (no remote)
+            result.push(RepoRow {
+                id: repo.path.clone(),
+                owner: None,
+                name: repo.name.clone(),
+                github_url: None,
+                ssh_url: None,
+                is_fork: false,
+                fork_parent: None,
+                is_private: false,
+                local_path: Some(repo.path),
+                git_status: Some(repo.status),
+            });
+        }
+    }
+
+    // Process GitHub repos, matching with local
+    for gh_repo in github_repos {
+        let normalized_url = normalize_github_url(&gh_repo.url);
+        let local = local_by_url.remove(&normalized_url);
+
+        result.push(RepoRow {
+            id: normalized_url,
+            owner: Some(gh_repo.owner.clone()),
+            name: gh_repo.name.clone(),
+            github_url: Some(gh_repo.url),
+            ssh_url: Some(gh_repo.ssh_url),
+            is_fork: gh_repo.is_fork,
+            fork_parent: gh_repo.fork_parent,
+            is_private: gh_repo.is_private,
+            local_path: local.as_ref().map(|l| l.path.clone()),
+            git_status: local.map(|l| l.status),
+        });
+    }
+
+    // Add any remaining local repos that weren't matched (different remote host, etc.)
+    for (_, repo) in local_by_url {
+        result.push(RepoRow {
+            id: repo.path.clone(),
+            owner: repo.remote_owner,
+            name: repo.name.clone(),
+            github_url: repo.remote_url.clone(),
+            ssh_url: repo.remote_url,
+            is_fork: false,
+            fork_parent: None,
+            is_private: false,
+            local_path: Some(repo.path),
+            git_status: Some(repo.status),
+        });
+    }
+
+    // Sort by owner (None last), then by name
+    result.sort_by(|a, b| {
+        match (&a.owner, &b.owner) {
+            (Some(oa), Some(ob)) => {
+                let owner_cmp = oa.to_lowercase().cmp(&ob.to_lowercase());
+                if owner_cmp == std::cmp::Ordering::Equal {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                } else {
+                    owner_cmp
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    result
+}
+
+fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
+    match view_mode {
+        ViewMode::Repos => vec![
+            "Navigation".to_string(),
+            "──────────".to_string(),
+            "j/↓        Move down".to_string(),
+            "k/↑        Move up".to_string(),
+            "G          Switch to Gists view".to_string(),
+            "".to_string(),
+            "Actions".to_string(),
+            "───────".to_string(),
+            "f          Fetch from remote".to_string(),
+            "l          Pull (fast-forward)".to_string(),
+            "p          Push to remote".to_string(),
+            "s          Sync (fetch+pull+push)".to_string(),
+            "c          Commit dirty files".to_string(),
+            "d          Show diff".to_string(),
+            "r          Refresh all".to_string(),
+            "".to_string(),
+            "Clone / Create".to_string(),
+            "──────────────".to_string(),
+            "Enter      Clone repo (if remote-only)".to_string(),
+            "g          Create GitHub repo (if local-only)".to_string(),
+            "x          Delete local copy (if synced)".to_string(),
+            "".to_string(),
+            "Status Icons".to_string(),
+            "────────────".to_string(),
+            "✓  Synced with remote".to_string(),
+            "↑  Ahead (unpushed commits)".to_string(),
+            "↓  Behind (can fast-forward)".to_string(),
+            "⇅  Diverged".to_string(),
+            "*  Dirty (uncommitted changes)".to_string(),
+            "?  No remote configured".to_string(),
+            "⑂  Fork".to_string(),
+            "".to_string(),
+            "Press ? or Esc to close".to_string(),
+        ],
+        ViewMode::Gists => vec![
+            "Navigation".to_string(),
+            "──────────".to_string(),
+            "j/↓        Move down".to_string(),
+            "k/↑        Move up".to_string(),
+            "G          Switch to Repos view".to_string(),
+            "".to_string(),
+            "Actions".to_string(),
+            "───────".to_string(),
+            "Enter      Clone gist locally".to_string(),
+            "x          Delete gist from GitHub".to_string(),
+            "r          Refresh".to_string(),
+            "".to_string(),
+            "Press ? or Esc to close".to_string(),
+        ],
+    }
+}
