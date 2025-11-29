@@ -1,4 +1,4 @@
-use crate::app::{App, GistRow, InputMode, PopupType, RepoRow, ViewMode};
+use crate::app::{App, GistRow, InputMode, PopupType, RepoRow, RepoType, ViewMode};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -92,22 +92,22 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
 
     // Column widths - pack left with fixed widths, Path takes remainder
     let widths = [
-        Constraint::Length(14),  // Owner
+        Constraint::Length(14),  // Origin
         Constraint::Length(20),  // Repository
-        Constraint::Length(12),  // Forked from
-        Constraint::Length(10),  // Status (icon + ahead/behind)
+        Constraint::Length(18),  // Type (includes upstream owner for forks)
+        Constraint::Length(3),   // Dirty indicator
+        Constraint::Length(10),  // Status (ahead/behind)
         Constraint::Min(20),     // Path
-        Constraint::Length(10),  // Remote
     ];
 
     // Header
     let header = Row::new(vec![
-        Cell::from("Owner").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Origin").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Repository").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Forked from").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Type").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)), // Dirty
         Cell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Remote").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().fg(Color::Cyan))
     .height(1);
@@ -125,12 +125,12 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
             };
 
             Row::new(vec![
-                Cell::from(format_owner(repo)),
+                Cell::from(format_origin(repo)),
                 Cell::from(format_repo_name(repo)),
-                Cell::from(format_fork_parent(repo)),
+                Cell::from(format_type(repo)),
+                Cell::from(format_dirty(repo)),
                 Cell::from(format_status(repo)),
                 Cell::from(format_path(repo)),
-                Cell::from(format_remote(repo)),
             ])
             .style(row_style)
         })
@@ -161,9 +161,11 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
     // Column widths - pack left
     let widths = [
         Constraint::Min(30),     // Description
-        Constraint::Length(8),   // Files
-        Constraint::Length(8),   // Public
-        Constraint::Length(25),  // Local
+        Constraint::Length(6),   // Files
+        Constraint::Length(7),   // Public
+        Constraint::Length(3),   // Dirty
+        Constraint::Length(10),  // Status
+        Constraint::Length(25),  // Path
     ];
 
     // Header
@@ -171,6 +173,8 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
         Cell::from("Description").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Files").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Public").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)), // Dirty
+        Cell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().fg(Color::Cyan))
@@ -193,6 +197,8 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(format_gist_description(gist)),
                 Cell::from(format!("{}", gist.file_names.len())),
                 Cell::from(if gist.is_public { "✓" } else { "" }),
+                Cell::from(format_gist_dirty(gist)),
+                Cell::from(format_gist_status(gist)),
                 Cell::from(format_gist_local(gist)),
             ])
             .style(row_style)
@@ -207,7 +213,7 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // Formatting helpers for repos table
-fn format_owner(repo: &RepoRow) -> Span<'static> {
+fn format_origin(repo: &RepoRow) -> Span<'static> {
     match &repo.owner {
         Some(owner) => {
             let display = truncate(owner, 13);
@@ -237,10 +243,37 @@ fn format_repo_name(repo: &RepoRow) -> Span<'static> {
     Span::styled(name, style)
 }
 
-fn format_fork_parent(repo: &RepoRow) -> Span<'static> {
-    if let Some(parent_owner) = repo.fork_owner() {
-        let display = truncate(parent_owner, 11);
-        Span::styled(display, Style::default().fg(Color::Magenta))
+fn format_type(repo: &RepoRow) -> Line<'static> {
+    match repo.repo_type() {
+        RepoType::Fork => {
+            // Fork symbol in purple + upstream owner
+            let mut spans = vec![Span::styled("⑂ ", Style::default().fg(Color::Magenta))];
+            if let Some(parent_owner) = repo.fork_owner() {
+                spans.push(Span::styled(
+                    truncate(parent_owner, 14),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            Line::from(spans)
+        }
+        RepoType::Source => {
+            // Source indicator (original repo)
+            Line::from(Span::styled("● src", Style::default().fg(Color::Green)))
+        }
+        RepoType::Clone => {
+            // Local clone
+            Line::from(Span::styled("◌ local", Style::default().fg(Color::Blue)))
+        }
+    }
+}
+
+fn format_dirty(repo: &RepoRow) -> Span<'static> {
+    if let Some(ref status) = repo.git_status {
+        if status.is_dirty() {
+            Span::styled("*", Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        }
     } else {
         Span::raw("")
     }
@@ -249,18 +282,31 @@ fn format_fork_parent(repo: &RepoRow) -> Span<'static> {
 fn format_status(repo: &RepoRow) -> Span<'static> {
     match &repo.git_status {
         Some(status) => {
-            let icon = status.status_icon();
-            let extra = if status.ahead > 0 && status.behind > 0 {
-                format!("{} +{}/-{}", icon, status.ahead, status.behind)
+            if !status.has_remote {
+                return Span::styled("?", Style::default().fg(Color::Blue));
+            }
+
+            let text = if status.ahead > 0 && status.behind > 0 {
+                format!("⇅ +{}/-{}", status.ahead, status.behind)
             } else if status.ahead > 0 {
-                format!("{} +{}", icon, status.ahead)
+                format!("↑ +{}", status.ahead)
             } else if status.behind > 0 {
-                format!("{} -{}", icon, status.behind)
+                format!("↓ -{}", status.behind)
             } else {
-                icon.to_string()
+                "✓".to_string()
             };
-            let color = get_status_color(repo);
-            Span::styled(extra, Style::default().fg(color))
+
+            let color = if status.ahead > 0 && status.behind > 0 {
+                Color::Red
+            } else if status.ahead > 0 {
+                Color::Magenta
+            } else if status.behind > 0 {
+                Color::Cyan
+            } else {
+                Color::Green
+            };
+
+            Span::styled(text, Style::default().fg(color))
         }
         None => Span::raw(""),
     }
@@ -277,41 +323,6 @@ fn format_path(repo: &RepoRow) -> Span<'static> {
     }
 }
 
-fn format_remote(repo: &RepoRow) -> Span<'static> {
-    if repo.github_url.is_some() {
-        let mut parts = Vec::new();
-        parts.push("✓");
-
-        if repo.is_private {
-            parts.push(" priv");
-        }
-
-        Span::styled(parts.join(""), Style::default().fg(Color::Green))
-    } else {
-        Span::styled("—", Style::default().fg(Color::DarkGray))
-    }
-}
-
-fn get_status_color(repo: &RepoRow) -> Color {
-    if let Some(ref status) = repo.git_status {
-        if status.is_dirty() {
-            Color::Yellow
-        } else if status.ahead > 0 && status.behind > 0 {
-            Color::Red
-        } else if status.ahead > 0 {
-            Color::Magenta
-        } else if status.behind > 0 {
-            Color::Cyan
-        } else if !status.has_remote {
-            Color::Blue
-        } else {
-            Color::Green
-        }
-    } else {
-        Color::White
-    }
-}
-
 // Formatting helpers for gists table
 fn format_gist_description(gist: &GistRow) -> Span<'static> {
     let desc = if gist.description.is_empty() {
@@ -319,14 +330,61 @@ fn format_gist_description(gist: &GistRow) -> Span<'static> {
     } else {
         gist.description.clone()
     };
-    Span::raw(truncate(&desc, 40))
+    // Grey if local exists, solid if remote-only
+    let style = if gist.has_local() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    Span::styled(truncate(&desc, 40), style)
+}
+
+fn format_gist_dirty(gist: &GistRow) -> Span<'static> {
+    if gist.is_dirty() {
+        Span::styled("*", Style::default().fg(Color::Yellow))
+    } else {
+        Span::raw("")
+    }
+}
+
+fn format_gist_status(gist: &GistRow) -> Span<'static> {
+    match &gist.git_status {
+        Some(status) => {
+            if !status.has_remote {
+                return Span::styled("?", Style::default().fg(Color::Blue));
+            }
+
+            let text = if status.ahead > 0 && status.behind > 0 {
+                format!("⇅ +{}/-{}", status.ahead, status.behind)
+            } else if status.ahead > 0 {
+                format!("↑ +{}", status.ahead)
+            } else if status.behind > 0 {
+                format!("↓ -{}", status.behind)
+            } else {
+                "✓".to_string()
+            };
+
+            let color = if status.ahead > 0 && status.behind > 0 {
+                Color::Red
+            } else if status.ahead > 0 {
+                Color::Magenta
+            } else if status.behind > 0 {
+                Color::Cyan
+            } else {
+                Color::Green
+            };
+
+            Span::styled(text, Style::default().fg(color))
+        }
+        None => Span::raw(""),
+    }
 }
 
 fn format_gist_local(gist: &GistRow) -> Span<'static> {
     match &gist.local_path {
         Some(path) => {
             let short = shorten_path(path);
-            Span::styled(truncate(&short, 23), Style::default().fg(Color::Green))
+            Span::styled(truncate(&short, 23), Style::default())
         }
         None => Span::styled("—", Style::default().fg(Color::DarkGray)),
     }
@@ -353,23 +411,69 @@ fn shorten_path(path: &str) -> String {
 }
 
 fn get_status_bar_text(app: &App) -> String {
-    if app.popup.is_some() {
-        return "j/k: scroll │ Esc: close │ Enter: select".to_string();
+    if let Some(ref popup) = app.popup {
+        return match popup.popup_type {
+            PopupType::Details => "Enter/Esc: close".to_string(),
+            PopupType::Ignored => "j/k/↑/↓: select │ Enter: unhide │ Esc: close".to_string(),
+            PopupType::Diff => "j/k/↑/↓: scroll │ c: commit & push │ Esc: close".to_string(),
+            _ => "j/k/↑/↓: scroll │ Esc: close".to_string(),
+        };
     }
 
     match app.view_mode {
         ViewMode::Repos => {
-            "j/k: nav │ g: gists │ Enter: details │ n: clone │ l: pull │ h: push │ s: sync │ c: commit │ f: diff │ d: del │ p: priv │ i: ignore │ ?".to_string()
+            let mut parts = vec!["↑/↓/j/k: nav", "g: gists", "Enter: details"];
+
+            // Dynamic actions based on selection
+            if let Some(repo) = app.get_selected_repo() {
+                if repo.is_remote_only() {
+                    parts.push("n: clone");
+                }
+                if repo.has_local() {
+                    parts.push("l: pull");
+                    parts.push("h: push");
+                    parts.push("s: sync");
+                    parts.push("f: diff");
+                    parts.push("d: del");
+                }
+                if app.can_change_visibility(repo) {
+                    parts.push("p: priv");
+                }
+                if repo.is_local_only() {
+                    parts.push("u: upload");
+                }
+            }
+            parts.push("i: ignore");
+            parts.push("?");
+
+            parts.join(" │ ")
         }
         ViewMode::Gists => {
-            "j/k: nav │ g: repos │ Enter: details │ n: clone │ d: delete │ r: refresh │ ?: help │ q: quit".to_string()
+            let mut parts = vec!["↑/↓/j/k: nav", "g: repos", "Enter: details"];
+
+            if let Some(gist) = app.get_selected_gist() {
+                if gist.local_path.is_none() {
+                    parts.push("n: clone");
+                }
+                if gist.has_local() {
+                    parts.push("l: pull");
+                    parts.push("h: push");
+                    parts.push("s: sync");
+                    parts.push("f: diff");
+                }
+            }
+            parts.push("d: delete");
+            parts.push("r: refresh");
+            parts.push("?");
+
+            parts.join(" │ ")
         }
     }
 }
 
 fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
     let (width, height) = match popup.popup_type {
-        PopupType::Help => (60, 70),
+        PopupType::Help => (55, 70),
         PopupType::DirtyFiles => (60, 50),
         PopupType::Diff => (80, 90),
         PopupType::Details => (60, 50),
@@ -423,6 +527,9 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
                 } else {
                     Line::from(s.clone())
                 }
+            } else if popup.popup_type == PopupType::Help {
+                // Parse styled help content: "KEY|DESCRIPTION|COLOR"
+                format_help_line(s)
             } else if popup.popup_type == PopupType::Ignored && idx >= 2 {
                 // Highlight selected item in ignored popup (skip header)
                 if idx == popup.selected {
@@ -456,6 +563,63 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
             &mut scrollbar_state,
         );
     }
+}
+
+fn format_help_line(s: &str) -> Line<'static> {
+    if s.is_empty() {
+        return Line::from("");
+    }
+
+    let parts: Vec<&str> = s.split('|').collect();
+    if parts.len() < 2 {
+        return Line::from(s.to_string());
+    }
+
+    let key = parts[0];
+    let desc = parts[1];
+    let color_name = parts.get(2).unwrap_or(&"");
+
+    // Parse color
+    let color = match *color_name {
+        "cyan" => Some(Color::Cyan),
+        "magenta" => Some(Color::Magenta),
+        "yellow" => Some(Color::Yellow),
+        "green" => Some(Color::Green),
+        "red" => Some(Color::Red),
+        "blue" => Some(Color::Blue),
+        _ => None,
+    };
+
+    // Header line
+    if key == "HEADER" {
+        return Line::from(vec![
+            Span::styled(
+                desc.to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+
+    // Regular key-value line
+    let mut spans = Vec::new();
+
+    if !key.is_empty() {
+        let key_style = color
+            .map(|c| Style::default().fg(c))
+            .unwrap_or_else(|| Style::default().fg(Color::White));
+        spans.push(Span::styled(format!("{:10}", key), key_style));
+    } else {
+        spans.push(Span::raw("          "));
+    }
+
+    spans.push(Span::raw(" "));
+
+    let desc_style = color
+        .map(|c| Style::default().fg(c))
+        .unwrap_or_else(Style::default);
+    spans.push(Span::styled(desc.to_string(), desc_style));
+
+    Line::from(spans)
 }
 
 fn draw_commit_popup(f: &mut Frame, app: &App) {

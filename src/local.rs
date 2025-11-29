@@ -1,5 +1,6 @@
 use crate::git::{self, RepoStatus};
 use anyhow::Result;
+use std::path::Path;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -15,7 +16,9 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
     let mut repos = Vec::new();
 
     // Walk directory looking for .git folders
+    // Use follow_links to handle symlinked repos
     for entry in WalkDir::new(root)
+        .follow_links(true)
         .min_depth(1)
         .max_depth(5) // Support deep ghq-style paths
         .into_iter()
@@ -30,7 +33,14 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
             Err(_) => continue,
         };
 
-        if entry.file_name() == ".git" && entry.file_type().is_dir() {
+        // Check if this is a .git directory (follow symlinks)
+        let is_git_dir = entry.file_name() == ".git" && {
+            let path = entry.path();
+            // Use metadata (follows symlinks) instead of symlink_metadata
+            path.is_dir() || Path::new(path).exists()
+        };
+
+        if is_git_dir {
             let repo_path = entry.path().parent().unwrap();
             let repo_name = repo_path
                 .file_name()

@@ -1,4 +1,5 @@
 use crate::app::GistRow;
+use crate::git;
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -191,37 +192,42 @@ pub async fn fetch_gists_as_rows(local_root: &str) -> Result<Vec<GistRow>> {
     let gists: Vec<GitHubGist> = serde_json::from_slice(&output.stdout).unwrap_or_default();
 
     let gists_dir = format!("{}/gists", local_root);
+    let mut rows = Vec::new();
 
-    let rows: Vec<GistRow> = gists
-        .into_iter()
-        .map(|g| {
-            let local_path = {
-                let potential_path = format!("{}/{}", gists_dir, g.id);
-                if Path::new(&potential_path).exists() {
-                    Some(potential_path)
-                } else {
-                    None
-                }
-            };
+    for g in gists {
+        let potential_path = format!("{}/{}", gists_dir, g.id);
+        // Use symlink-following exists check
+        let local_path = if Path::new(&potential_path).exists() {
+            Some(potential_path.clone())
+        } else {
+            None
+        };
 
-            let description = g.description.unwrap_or_else(|| {
-                g.files.keys().next().cloned().unwrap_or_else(|| "Untitled".to_string())
-            });
+        // Get git status if local
+        let git_status = if local_path.is_some() {
+            git::get_repo_status(&potential_path).await.ok()
+        } else {
+            None
+        };
 
-            let file_names: Vec<String> = g.files.values().map(|f| f.filename.clone()).collect();
+        let description = g.description.unwrap_or_else(|| {
+            g.files.keys().next().cloned().unwrap_or_else(|| "Untitled".to_string())
+        });
 
-            GistRow {
-                id: g.id,
-                description,
-                is_public: g.public,
-                file_names,
-                html_url: g.html_url,
-                local_path,
-                created_at: g.created_at,
-                updated_at: g.updated_at,
-            }
-        })
-        .collect();
+        let file_names: Vec<String> = g.files.values().map(|f| f.filename.clone()).collect();
+
+        rows.push(GistRow {
+            id: g.id,
+            description,
+            is_public: g.public,
+            file_names,
+            html_url: g.html_url,
+            local_path,
+            git_status,
+            created_at: g.created_at,
+            updated_at: g.updated_at,
+        });
+    }
 
     Ok(rows)
 }
@@ -256,4 +262,17 @@ pub async fn set_visibility(repo: &str, visibility: &str) -> Result<()> {
         .output()
         .await?;
     Ok(())
+}
+
+pub async fn get_current_user() -> Result<String> {
+    let output = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to get current user");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

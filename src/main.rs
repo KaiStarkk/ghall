@@ -99,6 +99,40 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     _ => {}
                 }
             }
+            PopupType::Details => {
+                // Details popup - Enter or Esc closes
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.close_popup(),
+                    _ => {}
+                }
+            }
+            PopupType::Diff => {
+                // Diff popup - can scroll and commit
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
+                    KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
+                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(),
+                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(),
+                    KeyCode::Char('c') => {
+                        // Commit from diff screen if dirty
+                        let is_dirty = match app.view_mode {
+                            ViewMode::Repos => app.get_selected_repo()
+                                .and_then(|r| r.git_status.as_ref())
+                                .map(|s| s.is_dirty())
+                                .unwrap_or(false),
+                            ViewMode::Gists => app.get_selected_gist()
+                                .map(|g| g.is_dirty())
+                                .unwrap_or(false),
+                        };
+                        if is_dirty {
+                            app.close_popup();
+                            app.start_commit();
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {
                 match code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_popup(),
@@ -150,32 +184,63 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         // Clone remote-only repo (n for new/clone)
         KeyCode::Char('n') => {
-            app.clone_selected().await?;
-        }
-
-        // Git operations
-        KeyCode::Char('l') => app.pull_selected().await?,
-        KeyCode::Char('h') => app.push_selected().await?,  // h for push (changed from p)
-        KeyCode::Char('s') => app.sync_selected().await?,
-
-        // Commit dirty files
-        KeyCode::Char('c') => {
-            let is_dirty = app.get_selected_repo()
-                .and_then(|r| r.git_status.as_ref())
-                .map(|s| s.is_dirty())
+            let is_remote_only = app.get_selected_repo()
+                .map(|r| r.is_remote_only())
                 .unwrap_or(false);
-            if is_dirty {
-                app.start_commit();
+            if is_remote_only {
+                app.clone_selected().await?;
             }
         }
 
-        // Show diff (f for diff)
-        KeyCode::Char('f') => app.show_diff().await?,
+        // Git operations (only if has local)
+        KeyCode::Char('l') => {
+            let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
+            if has_local {
+                app.pull_selected().await?;
+            }
+        }
+        KeyCode::Char('h') => {
+            let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
+            if has_local {
+                app.push_selected().await?;
+            }
+        }
+        KeyCode::Char('s') => {
+            let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
+            if has_local {
+                app.sync_selected().await?;
+            }
+        }
 
-        // Toggle private/public (p)
-        KeyCode::Char('p') => app.toggle_private().await?,
+        // Show diff (f for diff) - only if has local
+        KeyCode::Char('f') => {
+            let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
+            if has_local {
+                app.show_diff().await?;
+            }
+        }
 
-        // Delete local copy (d for delete)
+        // Toggle private/public (p) - only if user owns the repo
+        KeyCode::Char('p') => {
+            let can_change = app.get_selected_repo()
+                .map(|r| app.can_change_visibility(r))
+                .unwrap_or(false);
+            if can_change {
+                app.toggle_private().await?;
+            }
+        }
+
+        // Upload local-only repo to GitHub (u)
+        KeyCode::Char('u') => {
+            let is_local_only = app.get_selected_repo()
+                .map(|r| r.is_local_only())
+                .unwrap_or(false);
+            if is_local_only {
+                app.upload_local_repo().await?;
+            }
+        }
+
+        // Delete local copy (d for delete) - only if has local
         KeyCode::Char('d') => {
             let has_local = app.get_selected_repo()
                 .map(|r| r.has_local())
@@ -200,7 +265,40 @@ async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         // Clone gist (n for new/clone)
         KeyCode::Char('n') => {
-            app.clone_gist().await?;
+            let is_remote_only = app.get_selected_gist()
+                .map(|g| g.local_path.is_none())
+                .unwrap_or(false);
+            if is_remote_only {
+                app.clone_gist().await?;
+            }
+        }
+
+        // Git operations (only if has local)
+        KeyCode::Char('l') => {
+            let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
+            if has_local {
+                app.pull_gist().await?;
+            }
+        }
+        KeyCode::Char('h') => {
+            let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
+            if has_local {
+                app.push_gist().await?;
+            }
+        }
+        KeyCode::Char('s') => {
+            let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
+            if has_local {
+                app.sync_gist().await?;
+            }
+        }
+
+        // Show diff (f for diff) - only if has local
+        KeyCode::Char('f') => {
+            let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
+            if has_local {
+                app.show_gist_diff().await?;
+            }
         }
 
         // Delete gist (d for delete)

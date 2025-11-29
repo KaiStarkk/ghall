@@ -53,6 +53,13 @@ impl Popup {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepoType {
+    Source,    // Original repo (not a fork)
+    Fork,      // Forked from another repo
+    Clone,     // Local clone without GitHub association
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub id: String,
@@ -83,6 +90,16 @@ impl RepoRow {
     pub fn fork_owner(&self) -> Option<&str> {
         self.fork_parent.as_ref().and_then(|p| p.split('/').next())
     }
+
+    pub fn repo_type(&self) -> RepoType {
+        if self.is_fork {
+            RepoType::Fork
+        } else if self.github_url.is_some() {
+            RepoType::Source
+        } else {
+            RepoType::Clone
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,13 +110,34 @@ pub struct GistRow {
     pub file_names: Vec<String>,
     pub html_url: String,
     pub local_path: Option<String>,
+    pub git_status: Option<RepoStatus>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+}
+
+impl GistRow {
+    pub fn has_local(&self) -> bool {
+        self.local_path.is_some()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.git_status.as_ref().map(|s| s.is_dirty()).unwrap_or(false)
+    }
+}
+
+// Running operation for async task tracking
+#[derive(Debug, Clone)]
+pub struct RunningOp {
+    pub description: String,
+    pub output: Vec<String>,
+    pub completed: bool,
+    pub success: Option<bool>,
 }
 
 pub struct App {
     pub local_root: String,
     pub view_mode: ViewMode,
+    pub github_username: Option<String>,
 
     // Data
     pub repos: Vec<RepoRow>,
@@ -116,13 +154,20 @@ pub struct App {
     pub popup: Option<Popup>,
     pub input_buffer: String,
     pub confirm_buffer: String,
+
+    // Running operations
+    pub running_ops: Vec<RunningOp>,
 }
 
 impl App {
     pub async fn new(local_root: String) -> Result<Self> {
+        // Fetch github username
+        let github_username = github::get_current_user().await.ok();
+
         let mut app = Self {
             local_root,
             view_mode: ViewMode::Repos,
+            github_username,
             repos: Vec::new(),
             gists: Vec::new(),
             ignored_repos: HashSet::new(),
@@ -133,12 +178,22 @@ impl App {
             popup: None,
             input_buffer: String::new(),
             confirm_buffer: String::new(),
+            running_ops: Vec::new(),
         };
 
         app.refresh().await?;
         app.status_message = None;
 
         Ok(app)
+    }
+
+    // Check if current user can modify repo visibility
+    pub fn can_change_visibility(&self, repo: &RepoRow) -> bool {
+        if let (Some(ref username), Some(ref owner)) = (&self.github_username, &repo.owner) {
+            username.eq_ignore_ascii_case(owner)
+        } else {
+            false
+        }
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
@@ -546,6 +601,77 @@ impl App {
         Ok(())
     }
 
+    pub async fn pull_gist(&mut self) -> Result<()> {
+        let info = self.get_selected_gist().and_then(|g| {
+            g.local_path.clone().map(|p| (g.id.clone(), p))
+        });
+        if let Some((id, path)) = info {
+            let display_id = &id[..8.min(id.len())];
+            self.status_message = Some(format!("Pulling gist {}...", display_id));
+            git::pull(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn push_gist(&mut self) -> Result<()> {
+        let info = self.get_selected_gist().and_then(|g| {
+            g.local_path.clone().map(|p| (g.id.clone(), p))
+        });
+        if let Some((id, path)) = info {
+            let display_id = &id[..8.min(id.len())];
+            self.status_message = Some(format!("Pushing gist {}...", display_id));
+            git::push(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn sync_gist(&mut self) -> Result<()> {
+        let info = self.get_selected_gist().and_then(|g| {
+            g.local_path.clone().map(|p| (g.id.clone(), p))
+        });
+        if let Some((id, path)) = info {
+            let display_id = &id[..8.min(id.len())];
+            self.status_message = Some(format!("Syncing gist {}...", display_id));
+            git::fetch(&path).await?;
+            git::pull(&path).await?;
+            git::push(&path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn show_gist_diff(&mut self) -> Result<()> {
+        let path = self.get_selected_gist().and_then(|g| g.local_path.clone());
+        if let Some(path) = path {
+            let diff = git::get_diff(&path).await?;
+            let lines: Vec<String> = diff.lines().map(|s| s.to_string()).collect();
+            if !lines.is_empty() {
+                self.popup = Some(Popup::new(PopupType::Diff, lines));
+            } else {
+                self.status_message = Some("No changes to show".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn upload_local_repo(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().and_then(|r| {
+            if r.is_local_only() {
+                r.local_path.clone().map(|p| (r.name.clone(), p))
+            } else {
+                None
+            }
+        });
+        if let Some((name, path)) = info {
+            self.status_message = Some(format!("Creating GitHub repo {}...", name));
+            github::create_repo(&name, &path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
     pub fn handle_char(&mut self, c: char) {
         match self.input_mode {
             InputMode::Commit => {
@@ -684,59 +810,66 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
     result
 }
 
-fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
+// Help content lines - format: "KEY|DESCRIPTION|COLOR" where COLOR is optional
+// Colors: cyan, magenta, yellow, green, red, blue
+pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
     match view_mode {
         ViewMode::Repos => vec![
-            "Navigation".to_string(),
-            "──────────".to_string(),
-            "j/↓        Move down".to_string(),
-            "k/↑        Move up".to_string(),
-            "g          Switch to Gists view".to_string(),
-            "Enter      Show details".to_string(),
+            "HEADER|Navigation".to_string(),
+            "j/↓|Move down|".to_string(),
+            "k/↑|Move up|".to_string(),
+            "g|Switch to Gists view|cyan".to_string(),
+            "Enter|Show details|".to_string(),
             "".to_string(),
-            "Git Actions".to_string(),
-            "───────────".to_string(),
-            "l          Pull (fast-forward)".to_string(),
-            "h          Push to remote".to_string(),
-            "s          Sync (fetch+pull+push)".to_string(),
-            "c          Commit dirty files".to_string(),
-            "f          Show diff".to_string(),
-            "r          Refresh all".to_string(),
+            "HEADER|Git Actions".to_string(),
+            "l|Pull (fast-forward)|cyan".to_string(),
+            "h|Push to remote|magenta".to_string(),
+            "s|Sync (fetch+pull+push)|green".to_string(),
+            "f|Show diff|yellow".to_string(),
+            "r|Refresh all|".to_string(),
             "".to_string(),
-            "Repository".to_string(),
-            "──────────".to_string(),
-            "n          Clone repo (if remote-only)".to_string(),
-            "p          Toggle private/public".to_string(),
-            "d          Delete local copy".to_string(),
-            "i          Ignore/hide repo".to_string(),
-            "I          Show ignored repos".to_string(),
+            "HEADER|Repository".to_string(),
+            "n|Clone repo (remote-only)|cyan".to_string(),
+            "u|Upload local repo to GitHub|magenta".to_string(),
+            "p|Toggle private/public|".to_string(),
+            "d|Delete local copy|red".to_string(),
+            "i|Ignore/hide repo|".to_string(),
+            "I|Show ignored repos|".to_string(),
             "".to_string(),
-            "Status Icons".to_string(),
-            "────────────".to_string(),
-            "✓  Synced with remote".to_string(),
-            "↑  Ahead (unpushed commits)".to_string(),
-            "↓  Behind (can fast-forward)".to_string(),
-            "⇅  Diverged".to_string(),
-            "*  Dirty (uncommitted changes)".to_string(),
-            "?  No remote configured".to_string(),
+            "HEADER|Type Icons".to_string(),
+            "● src|Original repository|green".to_string(),
+            "⑂|Fork (shows upstream)|magenta".to_string(),
+            "◌ local|Local clone only|blue".to_string(),
             "".to_string(),
-            "Press ? or Esc to close".to_string(),
+            "HEADER|Status Icons".to_string(),
+            "✓|Synced with remote|green".to_string(),
+            "↑|Ahead (unpushed)|magenta".to_string(),
+            "↓|Behind (can pull)|cyan".to_string(),
+            "⇅|Diverged|red".to_string(),
+            "*|Dirty (uncommitted)|yellow".to_string(),
+            "?|No remote configured|blue".to_string(),
+            "".to_string(),
+            "|Press ? or Esc to close|".to_string(),
         ],
         ViewMode::Gists => vec![
-            "Navigation".to_string(),
-            "──────────".to_string(),
-            "j/↓        Move down".to_string(),
-            "k/↑        Move up".to_string(),
-            "g          Switch to Repos view".to_string(),
-            "Enter      Show details".to_string(),
+            "HEADER|Navigation".to_string(),
+            "j/↓|Move down|".to_string(),
+            "k/↑|Move up|".to_string(),
+            "g|Switch to Repos view|cyan".to_string(),
+            "Enter|Show details|".to_string(),
             "".to_string(),
-            "Actions".to_string(),
-            "───────".to_string(),
-            "n          Clone gist locally".to_string(),
-            "d          Delete gist from GitHub".to_string(),
-            "r          Refresh".to_string(),
+            "HEADER|Git Actions".to_string(),
+            "l|Pull (fast-forward)|cyan".to_string(),
+            "h|Push to remote|magenta".to_string(),
+            "s|Sync (fetch+pull+push)|green".to_string(),
+            "f|Show diff|yellow".to_string(),
+            "r|Refresh all|".to_string(),
             "".to_string(),
-            "Press ? or Esc to close".to_string(),
+            "HEADER|Gist Actions".to_string(),
+            "n|Clone gist locally|cyan".to_string(),
+            "d|Delete gist from GitHub|red".to_string(),
+            "".to_string(),
+            "|Press ? or Esc to close|".to_string(),
         ],
     }
 }
