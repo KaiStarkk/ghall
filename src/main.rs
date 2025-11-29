@@ -5,7 +5,7 @@ mod local;
 mod ui;
 
 use anyhow::Result;
-use app::{App, InputMode, ViewMode};
+use app::{App, InputMode, PopupType, ViewMode};
 use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -88,14 +88,27 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
 
 async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
     // If popup is open, handle popup navigation
-    if app.popup.is_some() {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_popup(),
-            KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
-            KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(),
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(),
-            _ => {}
+    if let Some(ref popup) = app.popup {
+        match popup.popup_type {
+            PopupType::Ignored => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
+                    KeyCode::Char('j') | KeyCode::Down => app.popup_next(),
+                    KeyCode::Char('k') | KeyCode::Up => app.popup_prev(),
+                    KeyCode::Enter => app.unhide_selected_in_popup(),
+                    _ => {}
+                }
+            }
+            _ => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_popup(),
+                    KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
+                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(),
+                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(),
+                    _ => {}
+                }
+            }
         }
         return Ok(true);
     }
@@ -109,14 +122,17 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
 
-        // View mode toggle
-        KeyCode::Char('G') => app.toggle_view_mode(),
+        // View mode toggle (lowercase g)
+        KeyCode::Char('g') => app.toggle_view_mode(),
 
         // Help
         KeyCode::Char('?') => app.toggle_help(),
 
         // Refresh
         KeyCode::Char('r') => app.refresh().await?,
+
+        // Details popup
+        KeyCode::Enter => app.show_details(),
 
         // Mode-specific actions
         _ => {
@@ -132,47 +148,48 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
 
 async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
-        // Clone remote-only repo
-        KeyCode::Enter => {
+        // Clone remote-only repo (n for new/clone)
+        KeyCode::Char('n') => {
             app.clone_selected().await?;
         }
 
-        // Git operations (only for repos with local copy)
-        KeyCode::Char('f') => app.fetch_selected().await?,
+        // Git operations
         KeyCode::Char('l') => app.pull_selected().await?,
-        KeyCode::Char('p') => app.push_selected().await?,
+        KeyCode::Char('h') => app.push_selected().await?,  // h for push (changed from p)
         KeyCode::Char('s') => app.sync_selected().await?,
 
         // Commit dirty files
         KeyCode::Char('c') => {
-            if let Some(repo) = app.get_selected_repo() {
-                if repo.git_status.as_ref().map(|s| s.is_dirty()).unwrap_or(false) {
-                    app.show_dirty_files().await?;
-                    app.start_commit();
-                }
+            let is_dirty = app.get_selected_repo()
+                .and_then(|r| r.git_status.as_ref())
+                .map(|s| s.is_dirty())
+                .unwrap_or(false);
+            if is_dirty {
+                app.start_commit();
             }
         }
 
-        // Show diff
-        KeyCode::Char('d') => app.show_diff().await?,
+        // Show diff (f for diff)
+        KeyCode::Char('f') => app.show_diff().await?,
 
-        // Create GitHub repo for local-only
-        KeyCode::Char('g') => {
-            if let Some(repo) = app.get_selected_repo() {
-                if repo.is_local_only() {
-                    app.create_github_repo().await?;
-                }
+        // Toggle private/public (p)
+        KeyCode::Char('p') => app.toggle_private().await?,
+
+        // Delete local copy (d for delete)
+        KeyCode::Char('d') => {
+            let has_local = app.get_selected_repo()
+                .map(|r| r.has_local())
+                .unwrap_or(false);
+            if has_local {
+                app.start_delete_confirm();
             }
         }
 
-        // Delete local copy (only if synced)
-        KeyCode::Char('x') => {
-            if let Some(repo) = app.get_selected_repo() {
-                if repo.has_local() && repo.git_status.as_ref().map(|s| s.is_synced()).unwrap_or(false) {
-                    app.start_delete_confirm();
-                }
-            }
-        }
+        // Ignore/hide repo
+        KeyCode::Char('i') => app.toggle_ignore(),
+
+        // Show ignored repos popup
+        KeyCode::Char('I') => app.show_ignored_popup(),
 
         _ => {}
     }
@@ -181,13 +198,13 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
 
 async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
-        // Clone gist
-        KeyCode::Enter => {
+        // Clone gist (n for new/clone)
+        KeyCode::Char('n') => {
             app.clone_gist().await?;
         }
 
-        // Delete gist
-        KeyCode::Char('x') => {
+        // Delete gist (d for delete)
+        KeyCode::Char('d') => {
             app.start_gist_delete_confirm();
         }
 

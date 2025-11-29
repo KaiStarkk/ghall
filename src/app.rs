@@ -1,7 +1,7 @@
 use crate::git::RepoStatus;
 use crate::{git, github, local};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewMode {
@@ -21,6 +21,8 @@ pub enum PopupType {
     Help,
     DirtyFiles,
     Diff,
+    Details,
+    Ignored,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,7 @@ pub struct Popup {
     pub popup_type: PopupType,
     pub scroll: usize,
     pub content: Vec<String>,
+    pub selected: usize,
 }
 
 impl Popup {
@@ -36,6 +39,7 @@ impl Popup {
             popup_type,
             scroll: 0,
             content,
+            selected: 0,
         }
     }
 
@@ -51,10 +55,7 @@ impl Popup {
 
 #[derive(Debug, Clone)]
 pub struct RepoRow {
-    // Identity
     pub id: String,
-
-    // GitHub info (None if local-only)
     pub owner: Option<String>,
     pub name: String,
     pub github_url: Option<String>,
@@ -62,8 +63,6 @@ pub struct RepoRow {
     pub is_fork: bool,
     pub fork_parent: Option<String>,
     pub is_private: bool,
-
-    // Local info (None if remote-only)
     pub local_path: Option<String>,
     pub git_status: Option<RepoStatus>,
 }
@@ -73,16 +72,16 @@ impl RepoRow {
         self.local_path.is_some()
     }
 
-    pub fn has_remote(&self) -> bool {
-        self.github_url.is_some()
-    }
-
     pub fn is_local_only(&self) -> bool {
         self.local_path.is_some() && self.github_url.is_none()
     }
 
     pub fn is_remote_only(&self) -> bool {
         self.github_url.is_some() && self.local_path.is_none()
+    }
+
+    pub fn fork_owner(&self) -> Option<&str> {
+        self.fork_parent.as_ref().and_then(|p| p.split('/').next())
     }
 }
 
@@ -94,6 +93,8 @@ pub struct GistRow {
     pub file_names: Vec<String>,
     pub html_url: String,
     pub local_path: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 pub struct App {
@@ -103,6 +104,7 @@ pub struct App {
     // Data
     pub repos: Vec<RepoRow>,
     pub gists: Vec<GistRow>,
+    pub ignored_repos: HashSet<String>,
 
     // Selection
     pub selected: usize,
@@ -123,6 +125,7 @@ impl App {
             view_mode: ViewMode::Repos,
             repos: Vec::new(),
             gists: Vec::new(),
+            ignored_repos: HashSet::new(),
             selected: 0,
             scroll_offset: 0,
             status_message: Some("Loading...".to_string()),
@@ -154,7 +157,7 @@ impl App {
         self.gists = github::fetch_gists_as_rows(&self.local_root).await.unwrap_or_default();
 
         // Reset selection if out of bounds
-        let max = self.current_list_len().saturating_sub(1);
+        let max = self.visible_list_len().saturating_sub(1);
         if self.selected > max {
             self.selected = max;
         }
@@ -172,15 +175,22 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    fn current_list_len(&self) -> usize {
+    pub fn visible_repos(&self) -> Vec<&RepoRow> {
+        self.repos
+            .iter()
+            .filter(|r| !self.ignored_repos.contains(&r.id))
+            .collect()
+    }
+
+    fn visible_list_len(&self) -> usize {
         match self.view_mode {
-            ViewMode::Repos => self.repos.len(),
+            ViewMode::Repos => self.visible_repos().len(),
             ViewMode::Gists => self.gists.len(),
         }
     }
 
     pub fn next(&mut self) {
-        let count = self.current_list_len();
+        let count = self.visible_list_len();
         if count > 0 {
             self.selected = (self.selected + 1).min(count - 1);
         }
@@ -204,7 +214,7 @@ impl App {
 
     pub fn get_selected_repo(&self) -> Option<&RepoRow> {
         if self.view_mode == ViewMode::Repos {
-            self.repos.get(self.selected)
+            self.visible_repos().get(self.selected).copied()
         } else {
             None
         }
@@ -233,17 +243,120 @@ impl App {
         self.confirm_buffer.clear();
     }
 
-    // Git operations for selected repo
-    pub async fn fetch_selected(&mut self) -> Result<()> {
-        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
-        if let Some((name, Some(path))) = info {
-            self.status_message = Some(format!("Fetching {}...", name));
-            git::fetch(&path).await?;
-            self.refresh().await?;
+    // Show details popup for selected item
+    pub fn show_details(&mut self) {
+        match self.view_mode {
+            ViewMode::Repos => {
+                if let Some(repo) = self.get_selected_repo() {
+                    let mut content = vec![
+                        format!("Name: {}", repo.name),
+                        format!("Owner: {}", repo.owner.as_deref().unwrap_or("(local)")),
+                        "".to_string(),
+                    ];
+
+                    if let Some(ref url) = repo.github_url {
+                        content.push(format!("GitHub: {}", url));
+                    }
+                    if let Some(ref path) = repo.local_path {
+                        content.push(format!("Local: {}", path));
+                    }
+
+                    content.push("".to_string());
+
+                    if repo.is_fork {
+                        content.push(format!("Fork of: {}", repo.fork_parent.as_deref().unwrap_or("unknown")));
+                    }
+                    content.push(format!("Private: {}", if repo.is_private { "yes" } else { "no" }));
+
+                    if let Some(ref status) = repo.git_status {
+                        content.push("".to_string());
+                        content.push("Git Status:".to_string());
+                        content.push(format!("  Branch: {}", status.branch));
+                        if status.has_remote {
+                            content.push(format!("  Ahead: {}, Behind: {}", status.ahead, status.behind));
+                        } else {
+                            content.push("  No upstream configured".to_string());
+                        }
+                        if status.is_dirty() {
+                            content.push(format!("  Dirty: {} staged, {} untracked", status.staged, status.untracked));
+                        }
+                    }
+
+                    self.popup = Some(Popup::new(PopupType::Details, content));
+                }
+            }
+            ViewMode::Gists => {
+                if let Some(gist) = self.get_selected_gist() {
+                    let mut content = vec![
+                        format!("Description: {}", gist.description),
+                        format!("ID: {}", gist.id),
+                        format!("Public: {}", if gist.is_public { "yes" } else { "no" }),
+                        "".to_string(),
+                        format!("URL: {}", gist.html_url),
+                    ];
+
+                    if let Some(ref path) = gist.local_path {
+                        content.push(format!("Local: {}", path));
+                    }
+
+                    content.push("".to_string());
+                    content.push(format!("Files ({}):", gist.file_names.len()));
+                    for file in &gist.file_names {
+                        content.push(format!("  {}", file));
+                    }
+
+                    self.popup = Some(Popup::new(PopupType::Details, content));
+                }
+            }
         }
-        Ok(())
     }
 
+    // Toggle ignore for selected repo
+    pub fn toggle_ignore(&mut self) {
+        if let Some(repo) = self.get_selected_repo() {
+            let id = repo.id.clone();
+            if self.ignored_repos.contains(&id) {
+                self.ignored_repos.remove(&id);
+            } else {
+                self.ignored_repos.insert(id);
+                // Adjust selection if needed
+                let max = self.visible_list_len().saturating_sub(1);
+                if self.selected > max {
+                    self.selected = max;
+                }
+            }
+        }
+    }
+
+    // Show ignored repos popup
+    pub fn show_ignored_popup(&mut self) {
+        if self.ignored_repos.is_empty() {
+            self.popup = Some(Popup::new(PopupType::Ignored, vec!["No ignored repositories.".to_string()]));
+        } else {
+            let mut content: Vec<String> = self.ignored_repos.iter().cloned().collect();
+            content.sort();
+            content.insert(0, "Ignored Repositories (press Enter to unhide):".to_string());
+            content.insert(1, "".to_string());
+            self.popup = Some(Popup::new(PopupType::Ignored, content));
+        }
+    }
+
+    // Unhide selected repo in ignored popup
+    pub fn unhide_selected_in_popup(&mut self) {
+        if let Some(ref popup) = self.popup {
+            if popup.popup_type == PopupType::Ignored && popup.selected >= 2 {
+                let idx = popup.selected - 2; // Account for header lines
+                let ignored_list: Vec<String> = self.ignored_repos.iter().cloned().collect();
+                if let Some(id) = ignored_list.get(idx) {
+                    self.ignored_repos.remove(id);
+                }
+                // Refresh popup
+                self.show_ignored_popup();
+            }
+        }
+    }
+
+    // Git operations for selected repo
     pub async fn pull_selected(&mut self) -> Result<()> {
         let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
         if let Some((name, Some(path))) = info {
@@ -293,17 +406,6 @@ impl App {
         Ok(())
     }
 
-    pub async fn show_dirty_files(&mut self) -> Result<()> {
-        let path = self.get_selected_repo().and_then(|r| r.local_path.clone());
-        if let Some(path) = path {
-            let files = git::get_dirty_files(&path).await?;
-            if !files.is_empty() {
-                self.popup = Some(Popup::new(PopupType::DirtyFiles, files));
-            }
-        }
-        Ok(())
-    }
-
     pub async fn show_diff(&mut self) -> Result<()> {
         let path = self.get_selected_repo().and_then(|r| r.local_path.clone());
         if let Some(path) = path {
@@ -311,6 +413,8 @@ impl App {
             let lines: Vec<String> = diff.lines().map(|s| s.to_string()).collect();
             if !lines.is_empty() {
                 self.popup = Some(Popup::new(PopupType::Diff, lines));
+            } else {
+                self.status_message = Some("No changes to show".to_string());
             }
         }
         Ok(())
@@ -348,10 +452,10 @@ impl App {
     }
 
     pub fn start_delete_confirm(&mut self) {
-        let can_delete = self.get_selected_repo()
-            .map(|r| r.has_local() && r.git_status.as_ref().map(|s| s.is_synced()).unwrap_or(false))
+        let has_local = self.get_selected_repo()
+            .map(|r| r.has_local())
             .unwrap_or(false);
-        if can_delete {
+        if has_local {
             self.input_mode = InputMode::ConfirmDelete;
             self.confirm_buffer.clear();
         }
@@ -383,6 +487,19 @@ impl App {
         if let Some((name, path)) = info {
             self.status_message = Some(format!("Creating GitHub repo for {}...", name));
             github::create_repo(&name, &path).await?;
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn toggle_private(&mut self) -> Result<()> {
+        let info = self.get_selected_repo().and_then(|r| {
+            r.owner.clone().map(|o| (format!("{}/{}", o, r.name), r.is_private))
+        });
+        if let Some((name_with_owner, is_private)) = info {
+            let new_visibility = if is_private { "public" } else { "private" };
+            self.status_message = Some(format!("Setting {} to {}...", name_with_owner, new_visibility));
+            github::set_visibility(&name_with_owner, new_visibility).await?;
             self.refresh().await?;
         }
         Ok(())
@@ -450,6 +567,23 @@ impl App {
                 self.confirm_buffer.pop();
             }
             _ => {}
+        }
+    }
+
+    pub fn popup_next(&mut self) {
+        if let Some(ref mut popup) = self.popup {
+            if popup.popup_type == PopupType::Ignored {
+                let max = popup.content.len().saturating_sub(1);
+                popup.selected = (popup.selected + 1).min(max);
+            }
+        }
+    }
+
+    pub fn popup_prev(&mut self) {
+        if let Some(ref mut popup) = self.popup {
+            if popup.popup_type == PopupType::Ignored {
+                popup.selected = popup.selected.saturating_sub(1).max(2); // Min 2 to skip header
+            }
         }
     }
 }
@@ -557,23 +691,25 @@ fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "──────────".to_string(),
             "j/↓        Move down".to_string(),
             "k/↑        Move up".to_string(),
-            "G          Switch to Gists view".to_string(),
+            "g          Switch to Gists view".to_string(),
+            "Enter      Show details".to_string(),
             "".to_string(),
-            "Actions".to_string(),
-            "───────".to_string(),
-            "f          Fetch from remote".to_string(),
+            "Git Actions".to_string(),
+            "───────────".to_string(),
             "l          Pull (fast-forward)".to_string(),
-            "p          Push to remote".to_string(),
+            "h          Push to remote".to_string(),
             "s          Sync (fetch+pull+push)".to_string(),
             "c          Commit dirty files".to_string(),
-            "d          Show diff".to_string(),
+            "f          Show diff".to_string(),
             "r          Refresh all".to_string(),
             "".to_string(),
-            "Clone / Create".to_string(),
-            "──────────────".to_string(),
-            "Enter      Clone repo (if remote-only)".to_string(),
-            "g          Create GitHub repo (if local-only)".to_string(),
-            "x          Delete local copy (if synced)".to_string(),
+            "Repository".to_string(),
+            "──────────".to_string(),
+            "n          Clone repo (if remote-only)".to_string(),
+            "p          Toggle private/public".to_string(),
+            "d          Delete local copy".to_string(),
+            "i          Ignore/hide repo".to_string(),
+            "I          Show ignored repos".to_string(),
             "".to_string(),
             "Status Icons".to_string(),
             "────────────".to_string(),
@@ -583,7 +719,6 @@ fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "⇅  Diverged".to_string(),
             "*  Dirty (uncommitted changes)".to_string(),
             "?  No remote configured".to_string(),
-            "⑂  Fork".to_string(),
             "".to_string(),
             "Press ? or Esc to close".to_string(),
         ],
@@ -592,12 +727,13 @@ fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "──────────".to_string(),
             "j/↓        Move down".to_string(),
             "k/↑        Move up".to_string(),
-            "G          Switch to Repos view".to_string(),
+            "g          Switch to Repos view".to_string(),
+            "Enter      Show details".to_string(),
             "".to_string(),
             "Actions".to_string(),
             "───────".to_string(),
-            "Enter      Clone gist locally".to_string(),
-            "x          Delete gist from GitHub".to_string(),
+            "n          Clone gist locally".to_string(),
+            "d          Delete gist from GitHub".to_string(),
             "r          Refresh".to_string(),
             "".to_string(),
             "Press ? or Esc to close".to_string(),

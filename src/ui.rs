@@ -67,7 +67,7 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("│ "),
         Span::styled("[R]epos", repos_style),
         Span::raw("  "),
-        Span::styled("[G]ists", gists_style),
+        Span::styled("[g]ists", gists_style),
     ]);
 
     f.render_widget(Paragraph::new(title), area);
@@ -81,36 +81,39 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.repos.is_empty() {
+    let repos = app.visible_repos();
+
+    if repos.is_empty() {
         let empty = Paragraph::new("No repositories found. Press 'r' to refresh.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, inner);
         return;
     }
 
-    // Column widths
+    // Column widths - pack left with fixed widths, Path takes remainder
     let widths = [
         Constraint::Length(14),  // Owner
-        Constraint::Length(22),  // Repository
-        Constraint::Length(5),   // Fork
-        Constraint::Min(20),     // Local (path + status)
-        Constraint::Length(12),  // Remote
+        Constraint::Length(20),  // Repository
+        Constraint::Length(12),  // Forked from
+        Constraint::Length(10),  // Status (icon + ahead/behind)
+        Constraint::Min(20),     // Path
+        Constraint::Length(10),  // Remote
     ];
 
     // Header
     let header = Row::new(vec![
         Cell::from("Owner").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Repository").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Fork").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Local").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Forked from").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Remote").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().fg(Color::Cyan))
     .height(1);
 
     // Rows
-    let rows: Vec<Row> = app
-        .repos
+    let rows: Vec<Row> = repos
         .iter()
         .enumerate()
         .map(|(idx, repo)| {
@@ -124,8 +127,9 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(format_owner(repo)),
                 Cell::from(format_repo_name(repo)),
-                Cell::from(format_fork(repo)),
-                Cell::from(format_local(repo)),
+                Cell::from(format_fork_parent(repo)),
+                Cell::from(format_status(repo)),
+                Cell::from(format_path(repo)),
                 Cell::from(format_remote(repo)),
             ])
             .style(row_style)
@@ -154,12 +158,12 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Column widths
+    // Column widths - pack left
     let widths = [
         Constraint::Min(30),     // Description
         Constraint::Length(8),   // Files
         Constraint::Length(8),   // Public
-        Constraint::Length(20),  // Local
+        Constraint::Length(25),  // Local
     ];
 
     // Header
@@ -167,7 +171,7 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
         Cell::from("Description").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Files").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Public").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Local").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().fg(Color::Cyan))
     .height(1);
@@ -207,60 +211,67 @@ fn format_owner(repo: &RepoRow) -> Span<'static> {
     match &repo.owner {
         Some(owner) => {
             let display = truncate(owner, 13);
-            Span::styled(display, Style::default())
+            // Grey if local exists (we have it), solid if remote-only (we don't have it)
+            let style = if repo.has_local() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            Span::styled(display, style)
         }
-        None => Span::styled("(local)", Style::default().fg(Color::DarkGray)),
+        None => Span::styled("(local)", Style::default().fg(Color::Blue)),
     }
 }
 
 fn format_repo_name(repo: &RepoRow) -> Span<'static> {
-    let name = truncate(&repo.name, 21);
+    let name = truncate(&repo.name, 19);
     let style = if repo.is_local_only() {
         Style::default().fg(Color::Blue)
-    } else if repo.is_remote_only() {
+    } else if repo.has_local() {
+        // Has both local and remote - grey (we have it)
         Style::default().fg(Color::DarkGray)
     } else {
+        // Remote only - normal (we don't have it)
         Style::default()
     };
     Span::styled(name, style)
 }
 
-fn format_fork(repo: &RepoRow) -> Span<'static> {
-    if repo.is_fork {
-        Span::styled("⑂", Style::default().fg(Color::Magenta))
+fn format_fork_parent(repo: &RepoRow) -> Span<'static> {
+    if let Some(parent_owner) = repo.fork_owner() {
+        let display = truncate(parent_owner, 11);
+        Span::styled(display, Style::default().fg(Color::Magenta))
     } else {
         Span::raw("")
     }
 }
 
-fn format_local(repo: &RepoRow) -> Span<'static> {
+fn format_status(repo: &RepoRow) -> Span<'static> {
+    match &repo.git_status {
+        Some(status) => {
+            let icon = status.status_icon();
+            let extra = if status.ahead > 0 && status.behind > 0 {
+                format!("{} +{}/-{}", icon, status.ahead, status.behind)
+            } else if status.ahead > 0 {
+                format!("{} +{}", icon, status.ahead)
+            } else if status.behind > 0 {
+                format!("{} -{}", icon, status.behind)
+            } else {
+                icon.to_string()
+            };
+            let color = get_status_color(repo);
+            Span::styled(extra, Style::default().fg(color))
+        }
+        None => Span::raw(""),
+    }
+}
+
+fn format_path(repo: &RepoRow) -> Span<'static> {
     match &repo.local_path {
         Some(path) => {
-            let status_icon = repo
-                .git_status
-                .as_ref()
-                .map(|s| s.status_icon())
-                .unwrap_or("?");
-
-            let status_extra = repo.git_status.as_ref().map(|s| {
-                if s.ahead > 0 && s.behind > 0 {
-                    format!(" +{}/-{}", s.ahead, s.behind)
-                } else if s.ahead > 0 {
-                    format!(" +{}", s.ahead)
-                } else if s.behind > 0 {
-                    format!(" -{}", s.behind)
-                } else {
-                    String::new()
-                }
-            }).unwrap_or_default();
-
-            // Shorten path for display
             let short_path = shorten_path(path);
-            let display = format!("{} {}{}", status_icon, short_path, status_extra);
-            let truncated = truncate(&display, 30);
-
-            let color = get_status_color(repo);
-            Span::styled(truncated, Style::default().fg(color))
+            let truncated = truncate(&short_path, 35);
+            Span::styled(truncated, Style::default())
         }
         None => Span::styled("—", Style::default().fg(Color::DarkGray)),
     }
@@ -271,9 +282,6 @@ fn format_remote(repo: &RepoRow) -> Span<'static> {
         let mut parts = Vec::new();
         parts.push("✓");
 
-        if repo.is_fork {
-            parts.push(" fork");
-        }
         if repo.is_private {
             parts.push(" priv");
         }
@@ -318,7 +326,7 @@ fn format_gist_local(gist: &GistRow) -> Span<'static> {
     match &gist.local_path {
         Some(path) => {
             let short = shorten_path(path);
-            Span::styled(truncate(&short, 18), Style::default().fg(Color::Green))
+            Span::styled(truncate(&short, 23), Style::default().fg(Color::Green))
         }
         None => Span::styled("—", Style::default().fg(Color::DarkGray)),
     }
@@ -346,15 +354,15 @@ fn shorten_path(path: &str) -> String {
 
 fn get_status_bar_text(app: &App) -> String {
     if app.popup.is_some() {
-        return "j/k: scroll │ Esc: close".to_string();
+        return "j/k: scroll │ Esc: close │ Enter: select".to_string();
     }
 
     match app.view_mode {
         ViewMode::Repos => {
-            "j/k: nav │ G: gists │ Enter: clone │ f: fetch │ l: pull │ p: push │ s: sync │ c: commit │ d: diff │ ?: help │ q: quit".to_string()
+            "j/k: nav │ g: gists │ Enter: details │ n: clone │ l: pull │ h: push │ s: sync │ c: commit │ f: diff │ d: del │ p: priv │ i: ignore │ ?".to_string()
         }
         ViewMode::Gists => {
-            "j/k: nav │ G: repos │ Enter: clone │ x: delete │ r: refresh │ ?: help │ q: quit".to_string()
+            "j/k: nav │ g: repos │ Enter: details │ n: clone │ d: delete │ r: refresh │ ?: help │ q: quit".to_string()
         }
     }
 }
@@ -364,6 +372,8 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
         PopupType::Help => (60, 70),
         PopupType::DirtyFiles => (60, 50),
         PopupType::Diff => (80, 90),
+        PopupType::Details => (60, 50),
+        PopupType::Ignored => (60, 50),
     };
 
     let area = centered_rect(width, height, f.area());
@@ -373,6 +383,8 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
         PopupType::Help => " Help ",
         PopupType::DirtyFiles => " Dirty Files ",
         PopupType::Diff => " Diff ",
+        PopupType::Details => " Details ",
+        PopupType::Ignored => " Ignored Repos ",
     };
 
     let block = Block::default()
@@ -391,9 +403,10 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
     let visible_content: Vec<Line> = popup
         .content
         .iter()
+        .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|s| {
+        .map(|(idx, s)| {
             // Syntax highlighting for diff
             if popup.popup_type == PopupType::Diff {
                 if s.starts_with('+') && !s.starts_with("+++") {
@@ -409,6 +422,16 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
                     ))
                 } else {
                     Line::from(s.clone())
+                }
+            } else if popup.popup_type == PopupType::Ignored && idx >= 2 {
+                // Highlight selected item in ignored popup (skip header)
+                if idx == popup.selected {
+                    Line::from(Span::styled(
+                        format!("> {}", s),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                } else {
+                    Line::from(format!("  {}", s))
                 }
             } else {
                 Line::from(s.clone())

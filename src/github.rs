@@ -80,6 +80,8 @@ pub struct GitHubGist {
     #[serde(rename = "html_url")]
     pub html_url: String,
     pub files: HashMap<String, GistFile>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +217,8 @@ pub async fn fetch_gists_as_rows(local_root: &str) -> Result<Vec<GistRow>> {
                 file_names,
                 html_url: g.html_url,
                 local_path,
+                created_at: g.created_at,
+                updated_at: g.updated_at,
             }
         })
         .collect();
@@ -241,6 +245,14 @@ pub async fn clone_gist(gist_id: &str, path: &str) -> Result<()> {
 pub async fn delete_gist(gist_id: &str) -> Result<()> {
     Command::new("gh")
         .args(["gist", "delete", gist_id])
+        .output()
+        .await?;
+    Ok(())
+}
+
+pub async fn set_visibility(repo: &str, visibility: &str) -> Result<()> {
+    Command::new("gh")
+        .args(["repo", "edit", repo, "--visibility", visibility])
         .output()
         .await?;
     Ok(())
