@@ -2,6 +2,26 @@ use anyhow::Result;
 use std::path::Path;
 use tokio::process::Command;
 
+/// Result of a git operation with captured output
+#[derive(Debug, Clone)]
+pub struct GitOpResult {
+    pub success: bool,
+    pub stderr: String,
+}
+
+impl GitOpResult {
+    pub fn ok() -> Self {
+        Self { success: true, stderr: String::new() }
+    }
+
+    pub fn err(stderr: String) -> Self {
+        Self { success: false, stderr }
+    }
+}
+
+/// SSH command that auto-accepts new host keys (but rejects changed ones for security)
+const SSH_COMMAND: &str = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes";
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoStatus {
     pub branch: String,
@@ -14,69 +34,8 @@ pub struct RepoStatus {
 }
 
 impl RepoStatus {
-    pub fn status_icon(&self) -> &'static str {
-        if !self.has_remote {
-            "?"  // No remote
-        } else if self.dirty || self.staged > 0 || self.untracked > 0 {
-            "*"  // Dirty
-        } else if self.ahead > 0 && self.behind > 0 {
-            "⇅"  // Diverged
-        } else if self.ahead > 0 {
-            "↑"  // Ahead
-        } else if self.behind > 0 {
-            "↓"  // Behind
-        } else {
-            "✓"  // Synced
-        }
-    }
-
-    pub fn status_text(&self) -> String {
-        let mut parts = Vec::new();
-
-        if !self.has_remote {
-            return "no remote".to_string();
-        }
-
-        if self.ahead > 0 && self.behind > 0 {
-            parts.push(format!("+{}/-{}", self.ahead, self.behind));
-        } else if self.ahead > 0 {
-            parts.push(format!("+{} ahead", self.ahead));
-        } else if self.behind > 0 {
-            parts.push(format!("-{} behind", self.behind));
-        }
-
-        if self.dirty {
-            parts.push("dirty".to_string());
-        }
-        if self.staged > 0 {
-            parts.push(format!("{} staged", self.staged));
-        }
-        if self.untracked > 0 {
-            parts.push(format!("{} untracked", self.untracked));
-        }
-
-        if parts.is_empty() {
-            "synced".to_string()
-        } else {
-            parts.join(", ")
-        }
-    }
-
-    pub fn is_synced(&self) -> bool {
-        self.has_remote
-            && self.ahead == 0
-            && self.behind == 0
-            && !self.dirty
-            && self.staged == 0
-            && self.untracked == 0
-    }
-
     pub fn is_dirty(&self) -> bool {
         self.dirty || self.staged > 0 || self.untracked > 0
-    }
-
-    pub fn can_fast_forward(&self) -> bool {
-        self.behind > 0 && self.ahead == 0 && !self.dirty && self.staged == 0
     }
 }
 
@@ -93,26 +52,38 @@ pub async fn get_repo_status(path: &str) -> Result<RepoStatus> {
         .trim()
         .to_string();
 
-    // Check if remote exists
-    let remote_output = Command::new("git")
+    // Check if there are any remotes
+    let remotes_output = Command::new("git")
+        .args(["remote"])
+        .current_dir(path)
+        .output()
+        .await?;
+    let has_any_remote = remotes_output.status.success()
+        && !String::from_utf8_lossy(&remotes_output.stdout).trim().is_empty();
+
+    // Check if upstream tracking branch exists
+    let upstream_output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
         .current_dir(path)
         .output()
         .await?;
-    let has_remote = remote_output.status.success();
+    let has_upstream = upstream_output.status.success();
+
+    let branch_name = if branch.is_empty() {
+        "HEAD".to_string()
+    } else {
+        branch.clone()
+    };
 
     let mut status = RepoStatus {
-        branch: if branch.is_empty() {
-            "HEAD".to_string()
-        } else {
-            branch
-        },
-        has_remote,
+        branch: branch_name.clone(),
+        has_remote: has_any_remote,
         ..Default::default()
     };
 
-    if has_remote {
-        // Get ahead/behind counts
+    // Try to get ahead/behind counts
+    if has_upstream {
+        // Use configured upstream
         let rev_list = Command::new("git")
             .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
             .current_dir(path)
@@ -125,6 +96,35 @@ pub async fn get_repo_status(path: &str) -> Result<RepoStatus> {
             if parts.len() == 2 {
                 status.ahead = parts[0].parse().unwrap_or(0);
                 status.behind = parts[1].parse().unwrap_or(0);
+            }
+        }
+    } else if has_any_remote && !branch.is_empty() {
+        // Fallback: try origin/<branch> if it exists
+        let ref_check = Command::new("git")
+            .args(["rev-parse", "--verify", &format!("origin/{}", branch)])
+            .current_dir(path)
+            .output()
+            .await?;
+
+        if ref_check.status.success() {
+            let rev_list = Command::new("git")
+                .args([
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("HEAD...origin/{}", branch),
+                ])
+                .current_dir(path)
+                .output()
+                .await?;
+
+            if rev_list.status.success() {
+                let counts = String::from_utf8_lossy(&rev_list.stdout);
+                let parts: Vec<&str> = counts.trim().split('\t').collect();
+                if parts.len() == 2 {
+                    status.ahead = parts[0].parse().unwrap_or(0);
+                    status.behind = parts[1].parse().unwrap_or(0);
+                }
             }
         }
     }
@@ -175,116 +175,181 @@ pub async fn get_remote_url(path: &str) -> Option<String> {
     }
 }
 
-pub async fn fetch(path: &str) -> Result<()> {
-    Command::new("git")
+pub async fn fetch(path: &str) -> GitOpResult {
+    let output = Command::new("git")
         .args(["fetch", "--all", "--prune"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
         .current_dir(path)
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GitOpResult::err(e.to_string()),
+    }
 }
 
-pub async fn pull(path: &str) -> Result<()> {
-    Command::new("git")
+pub async fn pull(path: &str) -> GitOpResult {
+    let output = Command::new("git")
         .args(["pull", "--ff-only"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
         .current_dir(path)
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GitOpResult::err(e.to_string()),
+    }
 }
 
-pub async fn push(path: &str) -> Result<()> {
-    Command::new("git")
+pub async fn push(path: &str) -> GitOpResult {
+    let output = Command::new("git")
         .args(["push"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
         .current_dir(path)
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GitOpResult::err(e.to_string()),
+    }
 }
 
-pub async fn add_all(path: &str) -> Result<()> {
-    Command::new("git")
+pub async fn clone(url: &str, path: &str) -> GitOpResult {
+    // Create parent directory if needed
+    if let Some(parent) = Path::new(path).parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return GitOpResult::err(format!("Failed to create directory: {}", e));
+        }
+    }
+
+    let output = Command::new("git")
+        .args(["clone", url, path])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GitOpResult::err(e.to_string()),
+    }
+}
+
+/// Quicksync: fetch, ff-rebase, add all, commit with fixup, push
+pub async fn quicksync(path: &str) -> GitOpResult {
+    let path = Path::new(path);
+
+    // 1. Fetch
+    let fetch = Command::new("git")
+        .args(["fetch", "--all", "--prune"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
+        .current_dir(path)
+        .output()
+        .await;
+
+    if let Ok(out) = &fetch {
+        if !out.status.success() {
+            return GitOpResult::err(format!("Fetch failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+    } else if let Err(e) = fetch {
+        return GitOpResult::err(format!("Fetch failed: {}", e));
+    }
+
+    // 2. Fast-forward rebase (only if there are upstream changes)
+    let rebase = Command::new("git")
+        .args(["rebase", "--autostash"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
+        .current_dir(path)
+        .output()
+        .await;
+
+    if let Ok(out) = &rebase {
+        if !out.status.success() {
+            // Abort the rebase if it fails
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(path)
+                .output()
+                .await;
+            return GitOpResult::err(format!("Rebase failed: {}", String::from_utf8_lossy(&out.stderr)));
+        }
+    } else if let Err(e) = rebase {
+        return GitOpResult::err(format!("Rebase failed: {}", e));
+    }
+
+    // 3. Add all changes
+    let add = Command::new("git")
         .args(["add", "-A"])
         .current_dir(path)
         .output()
-        .await?;
-    Ok(())
-}
+        .await;
 
-pub async fn commit(path: &str, message: &str) -> Result<()> {
-    Command::new("git")
-        .args(["commit", "-m", message])
-        .current_dir(path)
-        .output()
-        .await?;
-    Ok(())
-}
-
-pub async fn clone(url: &str, path: &str) -> Result<()> {
-    // Create parent directory if needed
-    if let Some(parent) = Path::new(path).parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    if let Err(e) = add {
+        return GitOpResult::err(format!("Add failed: {}", e));
     }
 
-    Command::new("git")
-        .args(["clone", url, path])
+    // 4. Check if there are staged changes
+    let status = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(path)
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    let has_staged = status.map(|o| !o.status.success()).unwrap_or(false);
+
+    // 5. Commit with fixup message if there are changes
+    if has_staged {
+        let commit = Command::new("git")
+            .args(["commit", "-m", "fixup"])
+            .current_dir(path)
+            .output()
+            .await;
+
+        if let Ok(out) = &commit {
+            if !out.status.success() {
+                return GitOpResult::err(format!("Commit failed: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+        } else if let Err(e) = commit {
+            return GitOpResult::err(format!("Commit failed: {}", e));
+        }
+    }
+
+    // 6. Push
+    let push = Command::new("git")
+        .args(["push"])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
+        .current_dir(path)
+        .output()
+        .await;
+
+    match push {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(format!("Push failed: {}", String::from_utf8_lossy(&out.stderr))),
+        Err(e) => GitOpResult::err(format!("Push failed: {}", e)),
+    }
 }
 
-pub async fn get_dirty_files(path: &str) -> Result<Vec<String>> {
+/// Get the Unix timestamp of the last commit
+pub async fn get_last_commit_time(path: &str) -> Option<i64> {
     let output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["log", "-1", "--format=%ct"])
         .current_dir(path)
         .output()
-        .await?;
+        .await
+        .ok()?;
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<String> = text
-        .lines()
-        .map(|line| {
-            let status = &line[0..2];
-            let file = &line[3..];
-            format!("{} {}", status, file)
-        })
-        .collect();
-
-    Ok(files)
-}
-
-pub async fn get_diff(path: &str) -> Result<String> {
-    // Get both staged and unstaged changes
-    let unstaged = Command::new("git")
-        .args(["diff", "--color=never"])
-        .current_dir(path)
-        .output()
-        .await?;
-
-    let staged = Command::new("git")
-        .args(["diff", "--cached", "--color=never"])
-        .current_dir(path)
-        .output()
-        .await?;
-
-    let mut result = String::new();
-
-    let staged_text = String::from_utf8_lossy(&staged.stdout);
-    if !staged_text.is_empty() {
-        result.push_str("=== STAGED CHANGES ===\n");
-        result.push_str(&staged_text);
-        result.push('\n');
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .ok()
+    } else {
+        None
     }
-
-    let unstaged_text = String::from_utf8_lossy(&unstaged.stdout);
-    if !unstaged_text.is_empty() {
-        result.push_str("=== UNSTAGED CHANGES ===\n");
-        result.push_str(&unstaged_text);
-    }
-
-    Ok(result)
-}
-
-pub fn is_git_repo(path: &Path) -> bool {
-    path.join(".git").exists()
 }

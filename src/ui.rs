@@ -1,4 +1,5 @@
-use crate::app::{App, GistRow, InputMode, PopupType, RepoRow, RepoType, ViewMode};
+use crate::app::{App, DeleteType, GistRow, InputMode, PopupType, RepoRow, SortColumn, UploadField, ViewMode};
+use crate::config::Column;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -10,38 +11,34 @@ use ratatui::{
     Frame,
 };
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Title bar with mode tabs
             Constraint::Min(0),    // Main content (table)
-            Constraint::Length(1), // Status bar
+            Constraint::Length(2), // Status bar (2 lines for all hotkeys)
         ])
         .split(f.area());
 
     // Title bar with view mode tabs
     draw_title_bar(f, chunks[0], app);
 
-    // Main content - table
+    // Main content - table (store area for mouse detection)
+    let table_area = chunks[1];
+    app.table_area = Some((table_area.y, table_area.height));
     match app.view_mode {
-        ViewMode::Repos => draw_repos_table(f, chunks[1], app),
-        ViewMode::Gists => draw_gists_table(f, chunks[1], app),
+        ViewMode::Repos => draw_repos_table(f, table_area, app),
+        ViewMode::Gists => draw_gists_table(f, table_area, app),
     }
 
-    // Status bar
-    let status = if let Some(ref msg) = app.status_message {
-        msg.clone()
-    } else {
-        get_status_bar_text(app)
-    };
-    let status_bar = Paragraph::new(status).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(status_bar, chunks[2]);
+    // Status bar (2 lines)
+    draw_status_bar(f, chunks[2], app);
 
     // Draw popups/input modes
     match app.input_mode {
-        InputMode::Commit => draw_commit_popup(f, app),
         InputMode::ConfirmDelete => draw_confirm_delete_popup(f, app),
+        InputMode::UploadForm => draw_upload_form_popup(f, app),
         InputMode::Normal => {
             if let Some(ref popup) = app.popup {
                 draw_popup(f, popup);
@@ -65,9 +62,10 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
     let title = Line::from(vec![
         Span::styled(" ghall ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw("│ "),
-        Span::styled("[R]epos", repos_style),
+        Span::styled("Repos", repos_style),
         Span::raw("  "),
-        Span::styled("[g]ists", gists_style),
+        Span::styled("Gists", gists_style),
+        Span::styled("  (Tab to switch)", Style::default().fg(Color::DarkGray)),
     ]);
 
     f.render_widget(Paragraph::new(title), area);
@@ -90,29 +88,36 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Column widths - pack left with fixed widths, Path takes remainder
-    let widths = [
-        Constraint::Length(14),  // Origin
-        Constraint::Length(20),  // Repository
-        Constraint::Length(18),  // Type (includes upstream owner for forks)
-        Constraint::Length(3),   // Dirty indicator
-        Constraint::Length(10),  // Status (ahead/behind)
-        Constraint::Min(20),     // Path
-    ];
+    let columns = app.visible_columns();
+    let selected_col = app.selected_column_index();
 
-    // Header
-    let header = Row::new(vec![
-        Cell::from("Origin").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Repository").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Type").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("").style(Style::default().add_modifier(Modifier::BOLD)), // Dirty
-        Cell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
-    ])
-    .style(Style::default().fg(Color::Cyan))
-    .height(1);
+    // Build widths dynamically based on visible columns
+    let widths: Vec<Constraint> = columns.iter().map(|col| {
+        let w = col.width();
+        if w == 0 {
+            Constraint::Min(20) // Path column takes remainder
+        } else {
+            Constraint::Length(w)
+        }
+    }).collect();
 
-    // Rows
+    // Build header cells dynamically
+    let header_cells: Vec<Cell> = columns.iter().enumerate().map(|(idx, col)| {
+        let sort_col = SortColumn::from_column(*col);
+        let name = format_header(col.name(), sort_col, app);
+        let style = if idx == selected_col {
+            Style::default().add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        Cell::from(name).style(style)
+    }).collect();
+
+    let header = Row::new(header_cells)
+        .style(Style::default().fg(Color::Cyan))
+        .height(1);
+
+    // Rows - build cells dynamically based on visible columns
     let rows: Vec<Row> = repos
         .iter()
         .enumerate()
@@ -124,15 +129,22 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            Row::new(vec![
-                Cell::from(format_origin(repo)),
-                Cell::from(format_repo_name(repo)),
-                Cell::from(format_type(repo)),
-                Cell::from(format_dirty(repo)),
-                Cell::from(format_status(repo)),
-                Cell::from(format_path(repo)),
-            ])
-            .style(row_style)
+            let cells: Vec<Cell> = columns.iter().map(|col| {
+                match col {
+                    Column::Origin => Cell::from(format_origin(repo)),
+                    Column::Repository => Cell::from(format_repo_name(repo)),
+                    Column::Type => Cell::from(format_type(repo)),
+                    Column::Updated => Cell::from(format_updated(repo)),
+                    Column::Archived => Cell::from(format_archived(repo)),
+                    Column::Private => Cell::from(format_private(repo)),
+                    Column::Ghq => Cell::from(format_ghq(repo, app)),
+                    Column::Status => Cell::from(format_status(repo)),
+                    Column::Dirty => Cell::from(format_dirty(repo)),
+                    Column::Path => Cell::from(format_path(repo)),
+                }
+            }).collect();
+
+            Row::new(cells).style(row_style)
         })
         .collect();
 
@@ -244,26 +256,44 @@ fn format_repo_name(repo: &RepoRow) -> Span<'static> {
 }
 
 fn format_type(repo: &RepoRow) -> Line<'static> {
-    match repo.repo_type() {
-        RepoType::Fork => {
-            // Fork symbol in purple + upstream owner
-            let mut spans = vec![Span::styled("⑂ ", Style::default().fg(Color::Magenta))];
-            if let Some(parent_owner) = repo.fork_owner() {
-                spans.push(Span::styled(
-                    truncate(parent_owner, 14),
-                    Style::default().fg(Color::Magenta),
-                ));
-            }
-            Line::from(spans)
+    // Check if this is a fork
+    if repo.is_fork {
+        // Fork symbol in purple + upstream owner
+        let mut spans = vec![Span::styled("⑂ ", Style::default().fg(Color::Magenta))];
+        if let Some(parent_owner) = repo.fork_owner() {
+            spans.push(Span::styled(
+                truncate(parent_owner, 14),
+                Style::default().fg(Color::Magenta),
+            ));
         }
-        RepoType::Source => {
-            // Source indicator (original repo)
-            Line::from(Span::styled("● src", Style::default().fg(Color::Green)))
-        }
-        RepoType::Clone => {
-            // Local clone
-            Line::from(Span::styled("◌ local", Style::default().fg(Color::Blue)))
-        }
+        return Line::from(spans);
+    }
+
+    if repo.github_url.is_some() && repo.is_member {
+        // Source indicator (owned by user or their org)
+        Line::from(Span::styled("● src", Style::default().fg(Color::Green)))
+    } else if repo.github_url.is_some() {
+        // Clone from another owner (not a fork, not owned by user)
+        Line::from(Span::styled("◌ clone", Style::default().fg(Color::Cyan)))
+    } else {
+        // Local only
+        Line::from(Span::styled("◌ local", Style::default().fg(Color::Blue)))
+    }
+}
+
+fn format_private(repo: &RepoRow) -> Span<'static> {
+    if repo.is_private {
+        Span::styled("🔒", Style::default().fg(Color::Yellow))
+    } else {
+        Span::raw("")
+    }
+}
+
+fn format_archived(repo: &RepoRow) -> Span<'static> {
+    if repo.is_archived {
+        Span::styled("📦", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::raw("")
     }
 }
 
@@ -279,11 +309,63 @@ fn format_dirty(repo: &RepoRow) -> Span<'static> {
     }
 }
 
+fn format_ghq(repo: &RepoRow, app: &App) -> Span<'static> {
+    match repo.follows_ghq(&app.local_root) {
+        Some(true) => Span::styled("✓", Style::default().fg(Color::Green)),
+        Some(false) => Span::styled("✗", Style::default().fg(Color::Red)),
+        None => Span::raw(""), // No local or no GitHub info
+    }
+}
+
+fn format_updated(repo: &RepoRow) -> Span<'static> {
+    match repo.last_commit_time {
+        Some(timestamp) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let diff_secs = now - timestamp;
+
+            let text = if diff_secs < 60 {
+                "just now".to_string()
+            } else if diff_secs < 3600 {
+                format!("{}m ago", diff_secs / 60)
+            } else if diff_secs < 86400 {
+                format!("{}h ago", diff_secs / 3600)
+            } else if diff_secs < 604800 {
+                format!("{}d ago", diff_secs / 86400)
+            } else if diff_secs < 2592000 {
+                format!("{}w ago", diff_secs / 604800)
+            } else if diff_secs < 31536000 {
+                format!("{}mo ago", diff_secs / 2592000)
+            } else {
+                format!("{}y ago", diff_secs / 31536000)
+            };
+
+            let color = if diff_secs < 86400 {
+                Color::Green  // < 1 day
+            } else if diff_secs < 604800 {
+                Color::Yellow // < 1 week
+            } else {
+                Color::DarkGray // older
+            };
+
+            Span::styled(text, Style::default().fg(color))
+        }
+        None => Span::styled("—", Style::default().fg(Color::DarkGray)),
+    }
+}
+
 fn format_status(repo: &RepoRow) -> Span<'static> {
     match &repo.git_status {
         Some(status) => {
             if !status.has_remote {
                 return Span::styled("?", Style::default().fg(Color::Blue));
+            }
+
+            // Dirty takes precedence over ahead/behind
+            if status.is_dirty() {
+                return Span::styled("~", Style::default().fg(Color::Yellow));
             }
 
             let text = if status.ahead > 0 && status.behind > 0 {
@@ -354,6 +436,11 @@ fn format_gist_status(gist: &GistRow) -> Span<'static> {
                 return Span::styled("?", Style::default().fg(Color::Blue));
             }
 
+            // Dirty takes precedence over ahead/behind
+            if status.is_dirty() {
+                return Span::styled("~", Style::default().fg(Color::Yellow));
+            }
+
             let text = if status.ahead > 0 && status.behind > 0 {
                 format!("⇅ +{}/-{}", status.ahead, status.behind)
             } else if status.ahead > 0 {
@@ -390,6 +477,16 @@ fn format_gist_local(gist: &GistRow) -> Span<'static> {
     }
 }
 
+// Format column header with sort indicator
+fn format_header(name: &str, column: SortColumn, app: &App) -> String {
+    if app.sort_column == column {
+        let arrow = if app.sort_ascending { "▲" } else { "▼" };
+        format!("[{} {}]", name, arrow)
+    } else {
+        name.to_string()
+    }
+}
+
 // Utility functions
 fn truncate(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
@@ -410,74 +507,135 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
-fn get_status_bar_text(app: &App) -> String {
+/// Draw the status bar with all hotkeys (enabled ones normal, disabled ones grey)
+fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
+    // If there's a status message, show it on first line
+    if let Some(ref msg) = app.status_message {
+        let status_line = Line::from(vec![
+            Span::styled(format!("{} ", app.spinner_char()), Style::default().fg(Color::Cyan)),
+            Span::styled(msg.clone(), Style::default().fg(Color::Yellow)),
+        ]);
+        f.render_widget(Paragraph::new(status_line), area);
+        return;
+    }
+
+    // Popup mode - show popup-specific help
     if let Some(ref popup) = app.popup {
-        return match popup.popup_type {
-            PopupType::Details => "Enter/Esc: close".to_string(),
-            PopupType::Ignored => "j/k/↑/↓: select │ Enter: unhide │ Esc: close".to_string(),
-            PopupType::Diff => "j/k/↑/↓: scroll │ c: commit & push │ Esc: close".to_string(),
-            _ => "j/k/↑/↓: scroll │ Esc: close".to_string(),
+        let help = match popup.popup_type {
+            PopupType::Details => "Enter/Esc: close",
+            PopupType::Ignored => "j/k/↑/↓: select │ Enter: unhide │ Esc: close",
+            _ => "j/k/↑/↓: scroll │ y: copy │ Esc: close",
         };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(help, Style::default().fg(Color::Gray)))),
+            area,
+        );
+        return;
     }
 
-    match app.view_mode {
-        ViewMode::Repos => {
-            let mut parts = vec!["↑/↓/j/k: nav", "g: gists", "Enter: details"];
+    // Build hotkey lines based on current selection
+    let (line1, line2) = match app.view_mode {
+        ViewMode::Repos => build_repos_hotkeys(app),
+        ViewMode::Gists => build_gists_hotkeys(app),
+    };
 
-            // Dynamic actions based on selection
-            if let Some(repo) = app.get_selected_repo() {
-                if repo.is_remote_only() {
-                    parts.push("n: clone");
-                }
-                if repo.has_local() {
-                    parts.push("l: pull");
-                    parts.push("h: push");
-                    parts.push("s: sync");
-                    parts.push("f: diff");
-                    parts.push("d: del");
-                }
-                if app.can_change_visibility(repo) {
-                    parts.push("p: priv");
-                }
-                if repo.is_local_only() {
-                    parts.push("u: upload");
-                }
-            }
-            parts.push("i: ignore");
-            parts.push("?");
+    f.render_widget(Paragraph::new(vec![line1, line2]), area);
+}
 
-            parts.join(" │ ")
-        }
-        ViewMode::Gists => {
-            let mut parts = vec!["↑/↓/j/k: nav", "g: repos", "Enter: details"];
+/// Helper to create a hotkey span (enabled or disabled)
+fn hotkey(key: &str, desc: &str, enabled: bool) -> Vec<Span<'static>> {
+    let style = if enabled {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    vec![
+        Span::styled(key.to_string(), style),
+        Span::styled(format!(":{} ", desc), style),
+    ]
+}
 
-            if let Some(gist) = app.get_selected_gist() {
-                if gist.local_path.is_none() {
-                    parts.push("n: clone");
-                }
-                if gist.has_local() {
-                    parts.push("l: pull");
-                    parts.push("h: push");
-                    parts.push("s: sync");
-                    parts.push("f: diff");
-                }
-            }
-            parts.push("d: delete");
-            parts.push("r: refresh");
-            parts.push("?");
+/// Build repos mode hotkey lines
+fn build_repos_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
+    let repo = app.get_selected_repo();
+    let has_local = repo.map(|r| r.has_local()).unwrap_or(false);
+    let is_remote_only = repo.map(|r| r.is_remote_only()).unwrap_or(false);
+    let is_local_only = repo.map(|r| r.is_local_only()).unwrap_or(false);
+    let is_dirty = repo.and_then(|r| r.git_status.as_ref()).map(|s| s.is_dirty()).unwrap_or(false);
+    let can_change = repo.map(|r| app.can_change_visibility(r)).unwrap_or(false);
+    let has_github = repo.map(|r| r.github_url.is_some()).unwrap_or(false);
+    let needs_ghq = repo.map(|r| r.follows_ghq(&app.local_root) == Some(false)).unwrap_or(false);
 
-            parts.join(" │ ")
-        }
-    }
+    // Error indicator
+    let mut spans1: Vec<Span> = if app.error_count() > 0 {
+        vec![Span::styled(format!("[{}err] ", app.error_count()), Style::default().fg(Color::Red))]
+    } else {
+        vec![]
+    };
+
+    // Line 1: Navigation + Git operations
+    spans1.extend(hotkey("↑↓", "nav", true));
+    spans1.extend(hotkey("←→", "sort", true));
+    spans1.extend(hotkey("v", "rev", true));
+    spans1.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+    spans1.extend(hotkey("n", "clone", is_remote_only));
+    spans1.extend(hotkey("l", "pull", has_local && !is_dirty));
+    spans1.extend(hotkey("h", "push", has_local && !is_dirty));
+    spans1.extend(hotkey("s", "sync", has_local && !is_dirty));
+    spans1.extend(hotkey("y", "qsync", has_local));
+    spans1.extend(hotkey("g", "git", has_local));
+
+    // Line 2: Repo actions + filters
+    let mut spans2: Vec<Span> = vec![];
+    spans2.extend(hotkey("p", "priv", can_change));
+    spans2.extend(hotkey("a", "arch", can_change));
+    spans2.extend(hotkey("o", "web", has_github));
+    spans2.extend(hotkey("O", "files", has_local));
+    spans2.extend(hotkey("u", "upload", is_local_only));
+    spans2.extend(hotkey("z", "ghq", needs_ghq));
+    spans2.extend(hotkey("d", "del", has_local));
+    spans2.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+    spans2.extend(hotkey("A", "arch", true));
+    spans2.extend(hotkey("P", "priv", true));
+    spans2.extend(hotkey("i", "hide", true));
+    spans2.extend(hotkey("r", "ref", true));
+    spans2.extend(hotkey("?", "help", true));
+
+    (Line::from(spans1), Line::from(spans2))
+}
+
+/// Build gists mode hotkey lines
+fn build_gists_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
+    let gist = app.get_selected_gist();
+    let has_local = gist.map(|g| g.has_local()).unwrap_or(false);
+    let is_remote_only = gist.map(|g| g.local_path.is_none()).unwrap_or(false);
+    let is_dirty = gist.map(|g| g.is_dirty()).unwrap_or(false);
+
+    let mut spans1: Vec<Span> = vec![];
+    spans1.extend(hotkey("↑↓", "nav", true));
+    spans1.extend(hotkey("Enter", "details", true));
+    spans1.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+    spans1.extend(hotkey("n", "clone", is_remote_only));
+    spans1.extend(hotkey("l", "pull", has_local && !is_dirty));
+    spans1.extend(hotkey("h", "push", has_local && !is_dirty));
+    spans1.extend(hotkey("s", "sync", has_local && !is_dirty));
+
+    let mut spans2: Vec<Span> = vec![];
+    spans2.extend(hotkey("d", "delete", true));
+    spans2.extend(hotkey("r", "refresh", true));
+    spans2.extend(hotkey("Tab", "repos", true));
+    spans2.extend(hotkey("?", "help", true));
+
+    (Line::from(spans1), Line::from(spans2))
 }
 
 fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
     let (width, height) = match popup.popup_type {
         PopupType::Help => (55, 70),
-        PopupType::DirtyFiles => (60, 50),
-        PopupType::Diff => (80, 90),
         PopupType::Details => (60, 50),
         PopupType::Ignored => (60, 50),
+        PopupType::Errors => (70, 60),
+        PopupType::Upload => return, // Upload form is drawn by draw_upload_form_popup
     };
 
     let area = centered_rect(width, height, f.area());
@@ -485,10 +643,10 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
 
     let title = match popup.popup_type {
         PopupType::Help => " Help ",
-        PopupType::DirtyFiles => " Dirty Files ",
-        PopupType::Diff => " Diff ",
         PopupType::Details => " Details ",
         PopupType::Ignored => " Ignored Repos ",
+        PopupType::Errors => " Error Log ",
+        PopupType::Upload => " Upload ",
     };
 
     let block = Block::default()
@@ -511,23 +669,7 @@ fn draw_popup(f: &mut Frame, popup: &crate::app::Popup) {
         .skip(scroll)
         .take(visible_height)
         .map(|(idx, s)| {
-            // Syntax highlighting for diff
-            if popup.popup_type == PopupType::Diff {
-                if s.starts_with('+') && !s.starts_with("+++") {
-                    Line::from(Span::styled(s.clone(), Style::default().fg(Color::Green)))
-                } else if s.starts_with('-') && !s.starts_with("---") {
-                    Line::from(Span::styled(s.clone(), Style::default().fg(Color::Red)))
-                } else if s.starts_with("@@") {
-                    Line::from(Span::styled(s.clone(), Style::default().fg(Color::Cyan)))
-                } else if s.starts_with("===") {
-                    Line::from(Span::styled(
-                        s.clone(),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(s.clone())
-                }
-            } else if popup.popup_type == PopupType::Help {
+            if popup.popup_type == PopupType::Help {
                 // Parse styled help content: "KEY|DESCRIPTION|COLOR"
                 format_help_line(s)
             } else if popup.popup_type == PopupType::Ignored && idx >= 2 {
@@ -622,43 +764,24 @@ fn format_help_line(s: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_commit_popup(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 30, f.area());
-    f.render_widget(Clear, area);
-
-    let block = Block::default()
-        .title(" Commit & Push ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ])
-        .split(inner);
-
-    let label = Paragraph::new("Enter commit message (Enter to confirm, Esc to cancel):");
-    f.render_widget(label, chunks[0]);
-
-    let input = Paragraph::new(app.input_buffer.as_str())
-        .style(Style::default().fg(Color::Yellow))
-        .block(Block::default().borders(Borders::ALL));
-    f.render_widget(input, chunks[1]);
-}
-
 fn draw_confirm_delete_popup(f: &mut Frame, app: &App) {
     let area = centered_rect(50, 25, f.area());
     f.render_widget(Clear, area);
 
-    let title = match app.view_mode {
-        ViewMode::Repos => " Confirm Delete Local ",
-        ViewMode::Gists => " Confirm Delete Gist ",
+    let (title, warning_text) = match app.pending_delete {
+        Some(DeleteType::LocalRepo) => (
+            " Confirm Delete Local ",
+            "Type 'y' or 'yes' to delete this repository locally:",
+        ),
+        Some(DeleteType::RemoteRepo) => (
+            " Confirm Delete Remote ",
+            "Type 'y' or 'yes' to DELETE THIS REPO FROM GITHUB:",
+        ),
+        Some(DeleteType::Gist) => (
+            " Confirm Delete Gist ",
+            "Type 'y' or 'yes' to delete this gist from GitHub:",
+        ),
+        None => (" Confirm Delete ", "Type 'y' or 'yes' to confirm:"),
     };
 
     let block = Block::default()
@@ -678,11 +801,6 @@ fn draw_confirm_delete_popup(f: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    let warning_text = match app.view_mode {
-        ViewMode::Repos => "Type 'y' or 'yes' to delete this repository locally:",
-        ViewMode::Gists => "Type 'y' or 'yes' to delete this gist from GitHub:",
-    };
-
     let warning = Paragraph::new(warning_text).style(Style::default().fg(Color::Red));
     f.render_widget(warning, chunks[0]);
 
@@ -690,6 +808,101 @@ fn draw_confirm_delete_popup(f: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::Red))
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(input, chunks[1]);
+}
+
+fn draw_upload_form_popup(f: &mut Frame, app: &App) {
+    let area = centered_rect(50, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Upload to GitHub ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(ref form) = app.upload_form {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Name
+                Constraint::Length(3), // Description
+                Constraint::Length(1), // Private
+                Constraint::Length(1), // Org
+                Constraint::Min(1),    // Instructions
+            ])
+            .margin(1)
+            .split(inner);
+
+        // Name field
+        let name_style = if form.active_field == UploadField::Name {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let name_block = Block::default()
+            .title(" Name ")
+            .borders(Borders::ALL)
+            .border_style(name_style);
+        let name_input = Paragraph::new(form.name.as_str())
+            .block(name_block);
+        f.render_widget(name_input, chunks[0]);
+
+        // Description field
+        let desc_style = if form.active_field == UploadField::Description {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let desc_block = Block::default()
+            .title(" Description (optional) ")
+            .borders(Borders::ALL)
+            .border_style(desc_style);
+        let desc_input = Paragraph::new(form.description.as_str())
+            .block(desc_block);
+        f.render_widget(desc_input, chunks[1]);
+
+        // Private toggle
+        let priv_style = if form.active_field == UploadField::Private {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let private_text = if form.private { "◉ Private" } else { "○ Public" };
+        let private_line = Line::from(vec![
+            Span::styled("Visibility: ", Style::default()),
+            Span::styled(private_text, priv_style),
+            Span::styled(" (←/→ to toggle)", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(private_line), chunks[2]);
+
+        // Org selection
+        let org_style = if form.active_field == UploadField::Org {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let org_text = if form.selected_org == 0 {
+            "Personal account".to_string()
+        } else {
+            form.orgs.get(form.selected_org - 1)
+                .cloned()
+                .unwrap_or_else(|| "?".to_string())
+        };
+        let org_line = Line::from(vec![
+            Span::styled("Owner:      ", Style::default()),
+            Span::styled(org_text, org_style),
+            Span::styled(" (←/→ to change)", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(org_line), chunks[3]);
+
+        // Instructions
+        let instr = Line::from(vec![
+            Span::styled("Tab/↓↑: navigate │ Enter: submit │ Esc: cancel", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(instr), chunks[4]);
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

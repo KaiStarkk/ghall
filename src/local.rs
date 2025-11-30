@@ -10,6 +10,7 @@ pub struct LocalRepo {
     pub status: RepoStatus,
     pub remote_owner: Option<String>,
     pub remote_url: Option<String>,
+    pub last_commit_time: Option<i64>,
 }
 
 pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
@@ -54,12 +55,16 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
             let remote_url = git::get_remote_url(&path_str).await;
             let remote_owner = remote_url.as_ref().and_then(|url| parse_owner_from_url(url));
 
+            // Get last commit time
+            let last_commit_time = git::get_last_commit_time(&path_str).await;
+
             repos.push(LocalRepo {
                 name: repo_name,
                 path: path_str,
                 status,
                 remote_owner,
                 remote_url,
+                last_commit_time,
             });
         }
     }

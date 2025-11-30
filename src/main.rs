@@ -1,19 +1,21 @@
 mod app;
+mod config;
 mod git;
 mod github;
 mod local;
 mod ui;
 
 use anyhow::Result;
-use app::{App, InputMode, PopupType, ViewMode};
+use app::{App, DeleteType, InputMode, PopupType, ViewMode};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
 use std::io;
+use std::process::Command;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -59,34 +61,92 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Spawn lazygit in the given repo directory
+fn spawn_lazygit<B: Backend>(terminal: &mut Terminal<B>, path: &str) -> Result<()> {
+    // Leave TUI mode
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+
+    // Spawn lazygit
+    let status = Command::new("lazygit")
+        .arg("-p")
+        .arg(path)
+        .status();
+
+    // Restore TUI mode
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Force terminal clear and redraw
+    terminal.clear()?;
+
+    // Check if lazygit succeeded
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => Ok(()), // lazygit exited with non-zero, but that's fine
+        Err(e) => Err(anyhow::anyhow!("Failed to spawn lazygit: {}", e)),
+    }
+}
+
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
+        // Tick spinner for status feedback
+        app.tick_spinner();
+
+        // Check for completed background tasks
+        app.poll_tasks();
+
+        // Handle pending refresh from background tasks
+        if app.pending_refresh {
+            app.pending_refresh = false;
+            app.refresh().await?;
+        }
+
         terminal.draw(|f| ui::draw(f, app))?;
 
         // Poll for events with timeout to allow async updates
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match app.input_mode {
-                        InputMode::Normal => {
-                            if !handle_normal_mode(app, key.code, key.modifiers).await? {
-                                return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        match app.input_mode {
+                            InputMode::Normal => {
+                                if !handle_normal_mode(terminal, app, key.code, key.modifiers).await? {
+                                    return Ok(());
+                                }
                             }
-                        }
-                        InputMode::Commit => {
-                            handle_commit_mode(app, key.code).await?;
-                        }
-                        InputMode::ConfirmDelete => {
-                            handle_confirm_delete_mode(app, key.code).await?;
+                            InputMode::ConfirmDelete => {
+                                handle_confirm_delete_mode(app, key.code).await?;
+                            }
+                            InputMode::UploadForm => {
+                                handle_upload_form_mode(app, key.code);
+                            }
                         }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if app.input_mode == InputMode::Normal && app.popup.is_none() {
+                        match mouse.kind {
+                            MouseEventKind::Down(_) => {
+                                app.handle_mouse_click(mouse.row, mouse.column);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.next();
+                            }
+                            MouseEventKind::ScrollUp => {
+                                app.previous();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
-async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
+async fn handle_normal_mode<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<bool> {
     // If popup is open, handle popup navigation
     if let Some(ref popup) = app.popup {
         match popup.popup_type {
@@ -106,33 +166,6 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     _ => {}
                 }
             }
-            PopupType::Diff => {
-                // Diff popup - can scroll and commit
-                match code {
-                    KeyCode::Esc | KeyCode::Char('q') => app.close_popup(),
-                    KeyCode::Char('j') | KeyCode::Down => app.scroll_down(),
-                    KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
-                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(),
-                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(),
-                    KeyCode::Char('c') => {
-                        // Commit from diff screen if dirty
-                        let is_dirty = match app.view_mode {
-                            ViewMode::Repos => app.get_selected_repo()
-                                .and_then(|r| r.git_status.as_ref())
-                                .map(|s| s.is_dirty())
-                                .unwrap_or(false),
-                            ViewMode::Gists => app.get_selected_gist()
-                                .map(|g| g.is_dirty())
-                                .unwrap_or(false),
-                        };
-                        if is_dirty {
-                            app.close_popup();
-                            app.start_commit();
-                        }
-                    }
-                    _ => {}
-                }
-            }
             _ => {
                 match code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => app.close_popup(),
@@ -140,6 +173,7 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     KeyCode::Char('k') | KeyCode::Up => app.scroll_up(),
                     KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(),
                     KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(),
+                    KeyCode::Char('y') => app.copy_popup_to_clipboard(),
                     _ => {}
                 }
             }
@@ -150,17 +184,31 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
     // Normal navigation and commands
     match code {
         // Quit
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+        KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
 
         // Navigation
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.previous(),
 
-        // View mode toggle (lowercase g)
-        KeyCode::Char('g') => app.toggle_view_mode(),
+        // Sorting column change and direction
+        KeyCode::Left => app.prev_sort_column(),
+        KeyCode::Right => app.next_sort_column(),
+        KeyCode::Char('v') => app.toggle_sort_direction(),
+
+        // Column reordering (< > move column, , . select column)
+        KeyCode::Char('<') => app.move_column_left(),
+        KeyCode::Char('>') => app.move_column_right(),
+        KeyCode::Char(',') => app.select_prev_column(),
+        KeyCode::Char('.') => app.select_next_column(),
+
+        // View mode toggle (Tab key)
+        KeyCode::Tab => app.toggle_view_mode(),
 
         // Help
         KeyCode::Char('?') => app.toggle_help(),
+
+        // Error log
+        KeyCode::Char('E') => app.show_error_log(),
 
         // Refresh
         KeyCode::Char('r') => app.refresh().await?,
@@ -168,10 +216,21 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
         // Details popup
         KeyCode::Enter => app.show_details(),
 
+        // Toggle show archived (capital A)
+        KeyCode::Char('A') => app.toggle_show_archived(),
+
+        // Toggle show private (capital P)
+        KeyCode::Char('P') => app.toggle_show_private(),
+
         // Mode-specific actions
         _ => {
             match app.view_mode {
-                ViewMode::Repos => handle_repos_action(app, code).await?,
+                ViewMode::Repos => {
+                    if let Some(lazygit_path) = handle_repos_action(app, code).await? {
+                        spawn_lazygit(terminal, &lazygit_path)?;
+                        app.refresh().await?;
+                    }
+                }
                 ViewMode::Gists => handle_gists_action(app, code).await?,
             }
         }
@@ -180,7 +239,8 @@ async fn handle_normal_mode(app: &mut App, code: KeyCode, modifiers: KeyModifier
     Ok(true)
 }
 
-async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
+/// Returns Some(path) if lazygit should be opened at that path
+async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<Option<String>> {
     match code {
         // Clone remote-only repo (n for new/clone)
         KeyCode::Char('n') => {
@@ -188,35 +248,42 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
                 .map(|r| r.is_remote_only())
                 .unwrap_or(false);
             if is_remote_only {
-                app.clone_selected().await?;
+                app.clone_selected();
             }
         }
 
-        // Git operations (only if has local)
+        // Git operations (only if has local) - spawned as background tasks
         KeyCode::Char('l') => {
             let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
             if has_local {
-                app.pull_selected().await?;
+                app.pull_selected();
             }
         }
         KeyCode::Char('h') => {
             let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
             if has_local {
-                app.push_selected().await?;
+                app.push_selected();
             }
         }
         KeyCode::Char('s') => {
             let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
             if has_local {
-                app.sync_selected().await?;
+                app.sync_selected();
             }
         }
 
-        // Show diff (f for diff) - only if has local
-        KeyCode::Char('f') => {
+        // Quicksync (y) - fetch, rebase, add, commit fixup, push
+        KeyCode::Char('y') => {
             let has_local = app.get_selected_repo().map(|r| r.has_local()).unwrap_or(false);
             if has_local {
-                app.show_diff().await?;
+                app.quicksync_selected();
+            }
+        }
+
+        // Open lazygit (g) - only if has local
+        KeyCode::Char('g') => {
+            if let Some(path) = app.get_selected_repo().and_then(|r| r.local_path.clone()) {
+                return Ok(Some(path));
             }
         }
 
@@ -226,7 +293,35 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
                 .map(|r| app.can_change_visibility(r))
                 .unwrap_or(false);
             if can_change {
-                app.toggle_private().await?;
+                app.toggle_private();
+            }
+        }
+
+        // Toggle archived (a) - only if user owns the repo
+        KeyCode::Char('a') => {
+            let can_change = app.get_selected_repo()
+                .map(|r| app.can_change_visibility(r))
+                .unwrap_or(false);
+            if can_change {
+                app.toggle_archived();
+            }
+        }
+
+        // Open in browser (o)
+        KeyCode::Char('o') => {
+            if let Some(url) = app.get_selected_repo().and_then(|r| r.github_url.clone()) {
+                let _ = Command::new("xdg-open")
+                    .arg(&url)
+                    .spawn();
+            }
+        }
+
+        // Open in file manager (O)
+        KeyCode::Char('O') => {
+            if let Some(path) = app.get_selected_repo().and_then(|r| r.local_path.clone()) {
+                let _ = Command::new("xdg-open")
+                    .arg(&path)
+                    .spawn();
             }
         }
 
@@ -236,7 +331,7 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
                 .map(|r| r.is_local_only())
                 .unwrap_or(false);
             if is_local_only {
-                app.upload_local_repo().await?;
+                app.show_upload_form();
             }
         }
 
@@ -256,9 +351,29 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<()> {
         // Show ignored repos popup
         KeyCode::Char('I') => app.show_ignored_popup(),
 
+        // Delete remote repo (D)
+        KeyCode::Char('D') => {
+            let can_delete = app.get_selected_repo()
+                .map(|r| r.github_url.is_some() && r.is_member)
+                .unwrap_or(false);
+            if can_delete {
+                app.start_delete_remote_confirm();
+            }
+        }
+
+        // Reorganize to ghq path (z)
+        KeyCode::Char('z') => {
+            let needs_reorg = app.get_selected_repo()
+                .map(|r| r.follows_ghq(&app.local_root) == Some(false))
+                .unwrap_or(false);
+            if needs_reorg {
+                app.reorganize_to_ghq();
+            }
+        }
+
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
@@ -269,35 +384,27 @@ async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
                 .map(|g| g.local_path.is_none())
                 .unwrap_or(false);
             if is_remote_only {
-                app.clone_gist().await?;
+                app.clone_gist();
             }
         }
 
-        // Git operations (only if has local)
+        // Git operations (only if has local) - spawned as background tasks
         KeyCode::Char('l') => {
             let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
             if has_local {
-                app.pull_gist().await?;
+                app.pull_gist();
             }
         }
         KeyCode::Char('h') => {
             let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
             if has_local {
-                app.push_gist().await?;
+                app.push_gist();
             }
         }
         KeyCode::Char('s') => {
             let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
             if has_local {
-                app.sync_gist().await?;
-            }
-        }
-
-        // Show diff (f for diff) - only if has local
-        KeyCode::Char('f') => {
-            let has_local = app.get_selected_gist().map(|g| g.has_local()).unwrap_or(false);
-            if has_local {
-                app.show_gist_diff().await?;
+                app.sync_gist();
             }
         }
 
@@ -311,11 +418,19 @@ async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-async fn handle_commit_mode(app: &mut App, code: KeyCode) -> Result<()> {
+async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> Result<()> {
     match code {
-        KeyCode::Esc => app.close_popup(),
+        KeyCode::Esc => {
+            app.pending_delete = None;
+            app.close_popup();
+        }
         KeyCode::Enter => {
-            app.commit_and_push().await?;
+            match app.pending_delete {
+                Some(DeleteType::LocalRepo) => app.delete_local_repo().await?,
+                Some(DeleteType::RemoteRepo) => app.delete_remote_repo().await?,
+                Some(DeleteType::Gist) => app.delete_gist().await?,
+                None => app.close_popup(),
+            }
         }
         KeyCode::Char(c) => app.handle_char(c),
         KeyCode::Backspace => app.handle_backspace(),
@@ -324,18 +439,49 @@ async fn handle_commit_mode(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> Result<()> {
+fn handle_upload_form_mode(app: &mut App, code: KeyCode) {
+    use app::UploadField;
+
     match code {
-        KeyCode::Esc => app.close_popup(),
+        KeyCode::Esc => {
+            app.cancel_upload_form();
+        }
         KeyCode::Enter => {
-            match app.view_mode {
-                ViewMode::Repos => app.delete_local_repo().await?,
-                ViewMode::Gists => app.delete_gist().await?,
+            // If on a text field, move to next field
+            // If on last field or pressing Enter on any field, submit
+            if let Some(ref form) = app.upload_form {
+                match form.active_field {
+                    UploadField::Org => app.submit_upload_form(),
+                    _ => app.upload_form_next_field(),
+                }
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            app.upload_form_next_field();
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.upload_form_prev_field();
+        }
+        KeyCode::Left => {
+            if let Some(ref form) = app.upload_form {
+                match form.active_field {
+                    UploadField::Private => app.upload_form_toggle_private(),
+                    UploadField::Org => app.upload_form_prev_org(),
+                    _ => {}
+                }
+            }
+        }
+        KeyCode::Right => {
+            if let Some(ref form) = app.upload_form {
+                match form.active_field {
+                    UploadField::Private => app.upload_form_toggle_private(),
+                    UploadField::Org => app.upload_form_next_org(),
+                    _ => {}
+                }
             }
         }
         KeyCode::Char(c) => app.handle_char(c),
         KeyCode::Backspace => app.handle_backspace(),
         _ => {}
     }
-    Ok(())
 }

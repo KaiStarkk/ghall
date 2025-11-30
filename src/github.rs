@@ -6,6 +6,26 @@ use std::collections::HashMap;
 use std::path::Path;
 use tokio::process::Command;
 
+/// SSH command that auto-accepts new host keys (but rejects changed ones for security)
+const SSH_COMMAND: &str = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes";
+
+/// Result of a GitHub CLI operation with captured output
+#[derive(Debug, Clone)]
+pub struct GhOpResult {
+    pub success: bool,
+    pub stderr: String,
+}
+
+impl GhOpResult {
+    pub fn ok() -> Self {
+        Self { success: true, stderr: String::new() }
+    }
+
+    pub fn err(stderr: String) -> Self {
+        Self { success: false, stderr }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GitHubRepoInfo {
     pub name: String,
@@ -14,7 +34,9 @@ pub struct GitHubRepoInfo {
     pub ssh_url: String,
     pub is_private: bool,
     pub is_fork: bool,
+    pub is_archived: bool,
     pub fork_parent: Option<String>,
+    pub is_member: bool, // User owns or is member of org
 }
 
 // GraphQL response types
@@ -52,6 +74,8 @@ struct Repository {
     is_private: bool,
     #[serde(rename = "isFork")]
     is_fork: bool,
+    #[serde(rename = "isArchived")]
+    is_archived: bool,
     parent: Option<ParentRepo>,
 }
 
@@ -102,6 +126,7 @@ query {
         sshUrl
         isPrivate
         isFork
+        isArchived
         parent { nameWithOwner }
       }
     }
@@ -116,6 +141,7 @@ query {
             sshUrl
             isPrivate
             isFork
+            isArchived
             parent { nameWithOwner }
           }
         }
@@ -157,7 +183,9 @@ pub async fn fetch_all_repos_graphql() -> Result<Vec<GitHubRepoInfo>> {
             ssh_url: repo.ssh_url,
             is_private: repo.is_private,
             is_fork: repo.is_fork,
+            is_archived: repo.is_archived,
             fork_parent: repo.parent.map(|p| p.name_with_owner),
+            is_member: true, // User's own repos
         });
     }
 
@@ -171,7 +199,9 @@ pub async fn fetch_all_repos_graphql() -> Result<Vec<GitHubRepoInfo>> {
                 ssh_url: repo.ssh_url,
                 is_private: repo.is_private,
                 is_fork: repo.is_fork,
+                is_archived: repo.is_archived,
                 fork_parent: repo.parent.map(|p| p.name_with_owner),
+                is_member: true, // User is member of org
             });
         }
     }
@@ -232,36 +262,155 @@ pub async fn fetch_gists_as_rows(local_root: &str) -> Result<Vec<GistRow>> {
     Ok(rows)
 }
 
-pub async fn create_repo(name: &str, path: &str) -> Result<()> {
-    Command::new("gh")
-        .args(["repo", "create", name, "--private", "--source", path, "--push"])
-        .output()
-        .await?;
-    Ok(())
+/// Options for creating a new repository
+pub struct CreateRepoOptions {
+    pub name: String,
+    pub path: String,
+    pub description: Option<String>,
+    pub private: bool,
+    pub org: Option<String>, // None = personal account
 }
 
-pub async fn clone_gist(gist_id: &str, path: &str) -> Result<()> {
-    Command::new("gh")
+pub async fn create_repo(opts: &CreateRepoOptions) -> GhOpResult {
+    let mut args = vec!["repo", "create"];
+
+    // Build full name (org/name or just name for personal)
+    let full_name = if let Some(ref org) = opts.org {
+        format!("{}/{}", org, opts.name)
+    } else {
+        opts.name.clone()
+    };
+    args.push(&full_name);
+
+    if opts.private {
+        args.push("--private");
+    } else {
+        args.push("--public");
+    }
+
+    args.push("--source");
+    args.push(&opts.path);
+    args.push("--push");
+
+    // Add description if provided
+    let desc_arg;
+    if let Some(ref desc) = opts.description {
+        if !desc.is_empty() {
+            args.push("--description");
+            desc_arg = desc.clone();
+            args.push(&desc_arg);
+        }
+    }
+
+    let output = Command::new("gh")
+        .args(&args)
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GhOpResult::ok(),
+        Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GhOpResult::err(e.to_string()),
+    }
+}
+
+pub async fn get_user_orgs() -> Result<Vec<String>> {
+    let output = Command::new("gh")
+        .args(["api", "user/orgs", "--jq", ".[].login"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let orgs: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+
+    Ok(orgs)
+}
+
+pub async fn clone_gist(gist_id: &str, path: &str) -> GhOpResult {
+    let output = Command::new("gh")
         .args(["gist", "clone", gist_id, path])
+        .env("GIT_SSH_COMMAND", SSH_COMMAND)
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GhOpResult::ok(),
+        Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GhOpResult::err(e.to_string()),
+    }
 }
 
-pub async fn delete_gist(gist_id: &str) -> Result<()> {
-    Command::new("gh")
+pub async fn delete_gist(gist_id: &str) -> GhOpResult {
+    let output = Command::new("gh")
         .args(["gist", "delete", gist_id])
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GhOpResult::ok(),
+        Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GhOpResult::err(e.to_string()),
+    }
 }
 
-pub async fn set_visibility(repo: &str, visibility: &str) -> Result<()> {
-    Command::new("gh")
-        .args(["repo", "edit", repo, "--visibility", visibility])
+pub async fn delete_repo(repo: &str) -> GhOpResult {
+    let output = Command::new("gh")
+        .args(["repo", "delete", repo, "--yes"])
         .output()
-        .await?;
-    Ok(())
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GhOpResult::ok(),
+        Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GhOpResult::err(e.to_string()),
+    }
+}
+
+pub async fn set_visibility(repo: &str, visibility: &str) -> GhOpResult {
+    let output = Command::new("gh")
+        .args(["repo", "edit", repo, "--visibility", visibility, "--accept-visibility-change-consequences"])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GhOpResult::ok(),
+        Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GhOpResult::err(e.to_string()),
+    }
+}
+
+pub async fn set_archived(repo: &str, archived: bool) -> GhOpResult {
+    if archived {
+        let output = Command::new("gh")
+            .args(["repo", "archive", repo, "--yes"])
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => GhOpResult::ok(),
+            Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+            Err(e) => GhOpResult::err(e.to_string()),
+        }
+    } else {
+        // Use API to unarchive (gh repo archive doesn't support --unarchive)
+        let output = Command::new("gh")
+            .args(["api", "-X", "PATCH", &format!("/repos/{}", repo), "-f", "archived=false"])
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => GhOpResult::ok(),
+            Ok(out) => GhOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+            Err(e) => GhOpResult::err(e.to_string()),
+        }
+    }
 }
 
 pub async fn get_current_user() -> Result<String> {

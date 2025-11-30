@@ -1,7 +1,30 @@
+use crate::config::{Column, Config};
 use crate::git::RepoStatus;
 use crate::{git, github, local};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use chrono::Local;
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Instant;
+use tokio::sync::mpsc;
+
+/// An entry in the error log
+#[derive(Debug, Clone)]
+pub struct ErrorLogEntry {
+    pub timestamp: String,
+    pub operation: String,
+    pub error: String,
+}
+
+impl ErrorLogEntry {
+    pub fn new(operation: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            timestamp: Local::now().format("%H:%M:%S").to_string(),
+            operation: operation.into(),
+            error: error.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewMode {
@@ -9,20 +32,175 @@ pub enum ViewMode {
     Gists,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SortColumn {
+    Origin,
+    Name,
+    Type,
+    Status,
+    LastUpdated,
+    Path,
+    Dirty,
+    Private,
+    Archived,
+    Ghq,
+}
+
+impl SortColumn {
+    /// Get next sort column based on visible columns
+    pub fn next(self, visible: &[Column]) -> Self {
+        let current_col = self.to_column();
+        if let Some(idx) = visible.iter().position(|&c| c == current_col) {
+            let next_idx = (idx + 1) % visible.len();
+            Self::from_column(visible[next_idx])
+        } else if !visible.is_empty() {
+            Self::from_column(visible[0])
+        } else {
+            self
+        }
+    }
+
+    /// Get previous sort column based on visible columns
+    pub fn prev(self, visible: &[Column]) -> Self {
+        let current_col = self.to_column();
+        if let Some(idx) = visible.iter().position(|&c| c == current_col) {
+            let prev_idx = if idx == 0 { visible.len() - 1 } else { idx - 1 };
+            Self::from_column(visible[prev_idx])
+        } else if !visible.is_empty() {
+            Self::from_column(visible[0])
+        } else {
+            self
+        }
+    }
+
+    /// Convert to Column enum
+    pub fn to_column(self) -> Column {
+        match self {
+            SortColumn::Origin => Column::Origin,
+            SortColumn::Name => Column::Repository,
+            SortColumn::Type => Column::Type,
+            SortColumn::Status => Column::Status,
+            SortColumn::LastUpdated => Column::Updated,
+            SortColumn::Path => Column::Path,
+            SortColumn::Dirty => Column::Dirty,
+            SortColumn::Private => Column::Private,
+            SortColumn::Archived => Column::Archived,
+            SortColumn::Ghq => Column::Ghq,
+        }
+    }
+
+    /// Convert from Column enum
+    pub fn from_column(col: Column) -> Self {
+        match col {
+            Column::Origin => SortColumn::Origin,
+            Column::Repository => SortColumn::Name,
+            Column::Type => SortColumn::Type,
+            Column::Status => SortColumn::Status,
+            Column::Updated => SortColumn::LastUpdated,
+            Column::Path => SortColumn::Path,
+            Column::Dirty => SortColumn::Dirty,
+            Column::Private => SortColumn::Private,
+            Column::Archived => SortColumn::Archived,
+            Column::Ghq => SortColumn::Ghq,
+        }
+    }
+
+    /// Convert from config string
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "origin" => SortColumn::Origin,
+            "repository" | "name" => SortColumn::Name,
+            "type" => SortColumn::Type,
+            "status" => SortColumn::Status,
+            "updated" | "lastupdated" => SortColumn::LastUpdated,
+            "path" => SortColumn::Path,
+            "dirty" => SortColumn::Dirty,
+            "private" | "priv" => SortColumn::Private,
+            "archived" | "arch" => SortColumn::Archived,
+            "ghq" => SortColumn::Ghq,
+            _ => SortColumn::LastUpdated,
+        }
+    }
+
+    /// Convert to config string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SortColumn::Origin => "origin",
+            SortColumn::Name => "repository",
+            SortColumn::Type => "type",
+            SortColumn::Status => "status",
+            SortColumn::LastUpdated => "updated",
+            SortColumn::Path => "path",
+            SortColumn::Dirty => "dirty",
+            SortColumn::Private => "private",
+            SortColumn::Archived => "archived",
+            SortColumn::Ghq => "ghq",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
     Normal,
-    Commit,
     ConfirmDelete,
+    UploadForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeleteType {
+    LocalRepo,
+    RemoteRepo,
+    Gist,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PopupType {
     Help,
-    DirtyFiles,
-    Diff,
     Details,
     Ignored,
+    Upload,
+    Errors,
+}
+
+/// Fields in the upload form
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UploadField {
+    Name,
+    Description,
+    Private,
+    Org,
+}
+
+impl UploadField {
+    pub fn next(self) -> Self {
+        match self {
+            UploadField::Name => UploadField::Description,
+            UploadField::Description => UploadField::Private,
+            UploadField::Private => UploadField::Org,
+            UploadField::Org => UploadField::Name,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            UploadField::Name => UploadField::Org,
+            UploadField::Description => UploadField::Name,
+            UploadField::Private => UploadField::Description,
+            UploadField::Org => UploadField::Private,
+        }
+    }
+}
+
+/// State for the upload form
+#[derive(Debug, Clone)]
+pub struct UploadFormState {
+    pub name: String,
+    pub description: String,
+    pub private: bool,
+    pub orgs: Vec<String>,        // Available orgs
+    pub selected_org: usize,      // 0 = personal, 1+ = org index
+    pub active_field: UploadField,
+    pub local_path: String,       // Path to upload from
 }
 
 #[derive(Debug, Clone)]
@@ -53,13 +231,6 @@ impl Popup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum RepoType {
-    Source,    // Original repo (not a fork)
-    Fork,      // Forked from another repo
-    Clone,     // Local clone without GitHub association
-}
-
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub id: String,
@@ -70,8 +241,11 @@ pub struct RepoRow {
     pub is_fork: bool,
     pub fork_parent: Option<String>,
     pub is_private: bool,
+    pub is_archived: bool,
+    pub is_member: bool, // User owns or is member of org
     pub local_path: Option<String>,
     pub git_status: Option<RepoStatus>,
+    pub last_commit_time: Option<i64>, // Unix timestamp
 }
 
 impl RepoRow {
@@ -91,13 +265,39 @@ impl RepoRow {
         self.fork_parent.as_ref().and_then(|p| p.split('/').next())
     }
 
-    pub fn repo_type(&self) -> RepoType {
-        if self.is_fork {
-            RepoType::Fork
-        } else if self.github_url.is_some() {
-            RepoType::Source
+    /// Returns the expected ghq-style path for this repo
+    pub fn expected_ghq_path(&self, local_root: &str) -> Option<String> {
+        if let Some(ref owner) = self.owner {
+            Some(format!("{}/github.com/{}/{}", local_root, owner, self.name))
         } else {
-            RepoType::Clone
+            None
+        }
+    }
+
+    /// Checks if the current local path follows ghq convention
+    pub fn follows_ghq(&self, local_root: &str) -> Option<bool> {
+        if let (Some(ref local_path), Some(ref owner)) = (&self.local_path, &self.owner) {
+            // Check if path matches pattern: {root}/github.com/{owner}/{name}
+            // Use case-insensitive comparison and resolve symlinks
+            let local = std::path::Path::new(local_path);
+            let canonical = local.canonicalize().ok();
+            let path_to_check = canonical.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| local_path.clone());
+
+            // Also canonicalize local_root
+            let root_canonical = std::path::Path::new(local_root)
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| local_root.to_string());
+
+            let expected = format!("{}/github.com/{}/{}", root_canonical, owner, self.name);
+
+            // Compare paths (case-insensitive for owner/name on case-insensitive filesystems)
+            Some(path_to_check.eq_ignore_ascii_case(&expected) || path_to_check == expected)
+        } else {
+            None // No local path or no GitHub info
         }
     }
 }
@@ -111,7 +311,9 @@ pub struct GistRow {
     pub html_url: String,
     pub local_path: Option<String>,
     pub git_status: Option<RepoStatus>,
+    #[allow(dead_code)]
     pub created_at: Option<String>,
+    #[allow(dead_code)]
     pub updated_at: Option<String>,
 }
 
@@ -125,14 +327,8 @@ impl GistRow {
     }
 }
 
-// Running operation for async task tracking
-#[derive(Debug, Clone)]
-pub struct RunningOp {
-    pub description: String,
-    pub output: Vec<String>,
-    pub completed: bool,
-    pub success: Option<bool>,
-}
+/// Braille spinner frames
+pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub struct App {
     pub local_root: String,
@@ -142,21 +338,54 @@ pub struct App {
     // Data
     pub repos: Vec<RepoRow>,
     pub gists: Vec<GistRow>,
-    pub ignored_repos: HashSet<String>,
 
-    // Selection
+    // Configuration (includes ignored_repos, columns, etc.)
+    pub config: Config,
+
+    // Selection and sorting
     pub selected: usize,
     pub scroll_offset: usize,
+    pub sort_column: SortColumn,
+    pub sort_ascending: bool,
+    pub show_archived: bool,
+    pub show_private: bool,
+
+    // Column selection for reordering (index into visible columns)
+    pub selected_column: usize,
 
     // UI state
     pub status_message: Option<String>,
+    pub status_time: Option<Instant>,
     pub input_mode: InputMode,
     pub popup: Option<Popup>,
     pub input_buffer: String,
     pub confirm_buffer: String,
+    pub pending_delete: Option<DeleteType>,
 
-    // Running operations
-    pub running_ops: Vec<RunningOp>,
+    // Table area for mouse click detection (y offset, height)
+    pub table_area: Option<(u16, u16)>,
+
+    // Spinner state for async operations
+    pub spinner_frame: usize,
+
+    // Background task communication
+    pub task_rx: mpsc::Receiver<TaskResult>,
+    pub task_tx: mpsc::Sender<TaskResult>,
+    pub pending_refresh: bool,
+
+    // Upload form state
+    pub upload_form: Option<UploadFormState>,
+
+    // Error log for viewing after quit
+    pub error_log: Vec<ErrorLogEntry>,
+}
+
+/// Result from a background task
+pub struct TaskResult {
+    pub success: bool,
+    pub message: String,
+    pub stderr: Option<String>, // Full stderr for error log
+    pub operation: String,      // Operation name for error log
 }
 
 impl App {
@@ -164,21 +393,46 @@ impl App {
         // Fetch github username
         let github_username = github::get_current_user().await.ok();
 
+        // Load config from XDG config
+        let config = Config::load();
+
+        // Create channel for background task results
+        let (task_tx, task_rx) = mpsc::channel(32);
+
+        // Initialize settings from config
+        let sort_column = SortColumn::from_string(&config.sort_column);
+        let sort_ascending = config.sort_ascending;
+        let show_archived = config.show_archived;
+        let show_private = config.show_private;
+
         let mut app = Self {
             local_root,
             view_mode: ViewMode::Repos,
             github_username,
             repos: Vec::new(),
             gists: Vec::new(),
-            ignored_repos: HashSet::new(),
+            config,
             selected: 0,
             scroll_offset: 0,
+            sort_column,
+            sort_ascending,
+            show_archived,
+            show_private,
+            selected_column: 0,
             status_message: Some("Loading...".to_string()),
+            status_time: Some(Instant::now()),
             input_mode: InputMode::Normal,
             popup: None,
             input_buffer: String::new(),
             confirm_buffer: String::new(),
-            running_ops: Vec::new(),
+            pending_delete: None,
+            table_area: None,
+            spinner_frame: 0,
+            task_rx,
+            task_tx,
+            pending_refresh: false,
+            upload_form: None,
+            error_log: Vec::new(),
         };
 
         app.refresh().await?;
@@ -189,15 +443,12 @@ impl App {
 
     // Check if current user can modify repo visibility
     pub fn can_change_visibility(&self, repo: &RepoRow) -> bool {
-        if let (Some(ref username), Some(ref owner)) = (&self.github_username, &repo.owner) {
-            username.eq_ignore_ascii_case(owner)
-        } else {
-            false
-        }
+        // Can change visibility if user owns or is member of org that owns the repo
+        repo.github_url.is_some() && repo.is_member
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
-        self.status_message = Some("Refreshing...".to_string());
+        self.set_status("Refreshing...");
 
         // Fetch GitHub repos via GraphQL
         let github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
@@ -208,6 +459,9 @@ impl App {
         // Merge into unified list
         self.repos = merge_repos(github_repos, local_repos);
 
+        // Re-apply user's sort settings (merge_repos does default sort)
+        self.sort_repos();
+
         // Fetch gists
         self.gists = github::fetch_gists_as_rows(&self.local_root).await.unwrap_or_default();
 
@@ -217,7 +471,7 @@ impl App {
             self.selected = max;
         }
 
-        self.status_message = None;
+        self.clear_status();
         Ok(())
     }
 
@@ -230,10 +484,114 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    pub fn next_sort_column(&mut self) {
+        self.sort_column = self.sort_column.next(&self.config.columns);
+        self.config.sort_column = self.sort_column.as_str().to_string();
+        self.config.save();
+        self.sort_repos();
+    }
+
+    pub fn prev_sort_column(&mut self) {
+        self.sort_column = self.sort_column.prev(&self.config.columns);
+        self.config.sort_column = self.sort_column.as_str().to_string();
+        self.config.save();
+        self.sort_repos();
+    }
+
+    pub fn toggle_show_archived(&mut self) {
+        self.show_archived = !self.show_archived;
+        self.config.show_archived = self.show_archived;
+        self.config.save();
+        self.selected = 0;
+    }
+
+    pub fn toggle_show_private(&mut self) {
+        self.show_private = !self.show_private;
+        self.config.show_private = self.show_private;
+        self.config.save();
+        self.selected = 0;
+    }
+
+    fn sort_repos(&mut self) {
+        let username = self.github_username.clone();
+        let sort_col = self.sort_column;
+        let ascending = self.sort_ascending;
+        let local_root = self.local_root.clone();
+
+        self.repos.sort_by(|a, b| {
+            let cmp = match sort_col {
+                SortColumn::Origin => {
+                    let a_owner = a.owner.as_deref().unwrap_or("~");
+                    let b_owner = b.owner.as_deref().unwrap_or("~");
+                    a_owner.to_lowercase().cmp(&b_owner.to_lowercase())
+                }
+                SortColumn::Name => {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                }
+                SortColumn::Type => {
+                    // Sort by: src (owned) < clone < fork < local
+                    let a_type = repo_type_sort_order(a, &username);
+                    let b_type = repo_type_sort_order(b, &username);
+                    a_type.cmp(&b_type)
+                }
+                SortColumn::Status => {
+                    // Sort by: dirty < diverged < ahead < behind < synced < no-local
+                    let a_status = status_sort_order(a);
+                    let b_status = status_sort_order(b);
+                    a_status.cmp(&b_status)
+                }
+                SortColumn::LastUpdated => {
+                    // Sort by time, None goes last
+                    match (a.last_commit_time, b.last_commit_time) {
+                        (Some(a_time), Some(b_time)) => a_time.cmp(&b_time),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                }
+                SortColumn::Path => {
+                    let a_path = a.local_path.as_deref().unwrap_or("~");
+                    let b_path = b.local_path.as_deref().unwrap_or("~");
+                    a_path.cmp(b_path)
+                }
+                SortColumn::Dirty => {
+                    // Sort dirty repos first
+                    let a_dirty = a.git_status.as_ref().map(|s| s.is_dirty()).unwrap_or(false);
+                    let b_dirty = b.git_status.as_ref().map(|s| s.is_dirty()).unwrap_or(false);
+                    b_dirty.cmp(&a_dirty) // Reverse so dirty comes first
+                }
+                SortColumn::Private => {
+                    // Sort private repos first
+                    b.is_private.cmp(&a.is_private)
+                }
+                SortColumn::Archived => {
+                    // Sort archived repos first
+                    b.is_archived.cmp(&a.is_archived)
+                }
+                SortColumn::Ghq => {
+                    // Sort by ghq compliance: non-compliant first, then compliant, then N/A
+                    let a_ghq = a.follows_ghq(&local_root);
+                    let b_ghq = b.follows_ghq(&local_root);
+                    match (a_ghq, b_ghq) {
+                        (Some(false), Some(true)) => std::cmp::Ordering::Less,
+                        (Some(true), Some(false)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                }
+            };
+            // Reverse if descending
+            if ascending { cmp } else { cmp.reverse() }
+        });
+    }
+
     pub fn visible_repos(&self) -> Vec<&RepoRow> {
         self.repos
             .iter()
-            .filter(|r| !self.ignored_repos.contains(&r.id))
+            .filter(|r| !self.config.ignored_repos.contains(&r.id))
+            .filter(|r| self.show_archived || !r.is_archived)
+            .filter(|r| self.show_private || !r.is_private)
             .collect()
     }
 
@@ -253,6 +611,206 @@ impl App {
 
     pub fn previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Advance the spinner frame and check for status message timeout
+    pub fn tick_spinner(&mut self) {
+        if self.status_message.is_some() {
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+
+            // Clear status message after 2 seconds (for non-loading messages)
+            if let Some(time) = self.status_time {
+                if time.elapsed().as_secs() >= 2 {
+                    // Don't clear if message contains "..." (still loading)
+                    if !self.status_message.as_ref().map(|m| m.contains("...")).unwrap_or(false) {
+                        self.status_message = None;
+                        self.status_time = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check for completed background tasks (non-blocking)
+    pub fn poll_tasks(&mut self) {
+        while let Ok(result) = self.task_rx.try_recv() {
+            // Handle special messages
+            if result.message.starts_with("__ORGS__:") {
+                let orgs_str = result.message.trim_start_matches("__ORGS__:");
+                if let Some(ref mut form) = self.upload_form {
+                    form.orgs = orgs_str.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                }
+                continue;
+            }
+
+            // Log errors with full stderr
+            if !result.success {
+                if let Some(stderr) = result.stderr {
+                    if !stderr.is_empty() {
+                        self.error_log.push(ErrorLogEntry::new(&result.operation, &stderr));
+                    }
+                }
+            }
+
+            self.set_status(result.message);
+            self.pending_refresh = true;
+        }
+    }
+
+    /// Show error log popup
+    pub fn show_error_log(&mut self) {
+        if self.error_log.is_empty() {
+            self.set_status("No errors logged");
+            return;
+        }
+
+        let content: Vec<String> = self.error_log.iter().flat_map(|e| {
+            vec![
+                format!("[{}] {}", e.timestamp, e.operation),
+                e.error.clone(),
+                String::new(),
+            ]
+        }).collect();
+
+        self.popup = Some(Popup::new(PopupType::Errors, content));
+    }
+
+    /// Get error count for status bar
+    pub fn error_count(&self) -> usize {
+        self.error_log.len()
+    }
+
+    /// Get the current spinner character
+    pub fn spinner_char(&self) -> char {
+        SPINNER_FRAMES[self.spinner_frame]
+    }
+
+    /// Set a status message with auto-clear timer
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_time = Some(Instant::now());
+    }
+
+    /// Clear status message
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+        self.status_time = None;
+    }
+
+    /// Toggle sort direction
+    pub fn toggle_sort_direction(&mut self) {
+        self.sort_ascending = !self.sort_ascending;
+        self.config.sort_ascending = self.sort_ascending;
+        self.config.save();
+        self.sort_repos();
+    }
+
+    /// Move selected column left
+    pub fn move_column_left(&mut self) {
+        if let Some(col) = self.config.columns.get(self.selected_column).copied() {
+            self.config.move_column_left(col);
+            if self.selected_column > 0 {
+                self.selected_column -= 1;
+            }
+            self.config.save();
+        }
+    }
+
+    /// Move selected column right
+    pub fn move_column_right(&mut self) {
+        if let Some(col) = self.config.columns.get(self.selected_column).copied() {
+            self.config.move_column_right(col);
+            if self.selected_column < self.config.columns.len() - 1 {
+                self.selected_column += 1;
+            }
+            self.config.save();
+        }
+    }
+
+    /// Select next column (for reordering)
+    pub fn select_next_column(&mut self) {
+        if !self.config.columns.is_empty() {
+            self.selected_column = (self.selected_column + 1) % self.config.columns.len();
+        }
+    }
+
+    /// Select previous column (for reordering)
+    pub fn select_prev_column(&mut self) {
+        if !self.config.columns.is_empty() {
+            if self.selected_column == 0 {
+                self.selected_column = self.config.columns.len() - 1;
+            } else {
+                self.selected_column -= 1;
+            }
+        }
+    }
+
+    /// Get visible columns
+    pub fn visible_columns(&self) -> &[Column] {
+        &self.config.columns
+    }
+
+    /// Get selected column index
+    pub fn selected_column_index(&self) -> usize {
+        self.selected_column
+    }
+
+    /// Copy popup content to clipboard
+    pub fn copy_popup_to_clipboard(&mut self) {
+        if let Some(ref popup) = self.popup {
+            let content = popup.content.join("\n");
+            // Try wl-copy first (Wayland), then xclip (X11)
+            let result = std::process::Command::new("wl-copy")
+                .arg(&content)
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("xclip")
+                        .args(["-selection", "clipboard"])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .and_then(|mut child| {
+                            use std::io::Write;
+                            if let Some(stdin) = child.stdin.as_mut() {
+                                stdin.write_all(content.as_bytes())?;
+                            }
+                            child.wait()
+                        })
+                });
+
+            match result {
+                Ok(status) if status.success() => {
+                    self.set_status("Copied to clipboard");
+                }
+                _ => {
+                    self.set_status("Failed to copy (install wl-copy or xclip)");
+                }
+            }
+        }
+    }
+
+    /// Select a specific row by index (for mouse clicks)
+    pub fn select_row(&mut self, row: usize) {
+        let count = self.visible_list_len();
+        if count > 0 && row < count {
+            self.selected = row;
+        }
+    }
+
+    /// Handle mouse click at position, returning true if it hit the table
+    pub fn handle_mouse_click(&mut self, row: u16, _col: u16) -> bool {
+        if let Some((table_y, table_height)) = self.table_area {
+            // Account for border (1) and header (1) = 2 rows offset
+            let header_offset = 2u16;
+            if row >= table_y + header_offset && row < table_y + table_height {
+                let clicked_row = (row - table_y - header_offset) as usize;
+                self.select_row(clicked_row);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn scroll_down(&mut self) {
@@ -370,25 +928,27 @@ impl App {
     pub fn toggle_ignore(&mut self) {
         if let Some(repo) = self.get_selected_repo() {
             let id = repo.id.clone();
-            if self.ignored_repos.contains(&id) {
-                self.ignored_repos.remove(&id);
+            if self.config.ignored_repos.contains(&id) {
+                self.config.ignored_repos.remove(&id);
             } else {
-                self.ignored_repos.insert(id);
+                self.config.ignored_repos.insert(id);
                 // Adjust selection if needed
                 let max = self.visible_list_len().saturating_sub(1);
                 if self.selected > max {
                     self.selected = max;
                 }
             }
+            // Save to config
+            self.config.save();
         }
     }
 
     // Show ignored repos popup
     pub fn show_ignored_popup(&mut self) {
-        if self.ignored_repos.is_empty() {
+        if self.config.ignored_repos.is_empty() {
             self.popup = Some(Popup::new(PopupType::Ignored, vec!["No ignored repositories.".to_string()]));
         } else {
-            let mut content: Vec<String> = self.ignored_repos.iter().cloned().collect();
+            let mut content: Vec<String> = self.config.ignored_repos.iter().cloned().collect();
             content.sort();
             content.insert(0, "Ignored Repositories (press Enter to unhide):".to_string());
             content.insert(1, "".to_string());
@@ -401,9 +961,11 @@ impl App {
         if let Some(ref popup) = self.popup {
             if popup.popup_type == PopupType::Ignored && popup.selected >= 2 {
                 let idx = popup.selected - 2; // Account for header lines
-                let ignored_list: Vec<String> = self.ignored_repos.iter().cloned().collect();
+                let ignored_list: Vec<String> = self.config.ignored_repos.iter().cloned().collect();
                 if let Some(id) = ignored_list.get(idx) {
-                    self.ignored_repos.remove(id);
+                    self.config.ignored_repos.remove(id);
+                    // Save to config
+                    self.config.save();
                 }
                 // Refresh popup
                 self.show_ignored_popup();
@@ -411,40 +973,109 @@ impl App {
         }
     }
 
-    // Git operations for selected repo
-    pub async fn pull_selected(&mut self) -> Result<()> {
+    // Git operations for selected repo (spawned as background tasks)
+    pub fn pull_selected(&mut self) {
         let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
         if let Some((name, Some(path))) = info {
-            self.status_message = Some(format!("Pulling {}...", name));
-            git::pull(&path).await?;
-            self.refresh().await?;
+            self.set_status(format!("Pulling {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("pull {}", name);
+            tokio::spawn(async move {
+                let result = git::pull(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Pulled {}", name)
+                    } else {
+                        "Pull failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn push_selected(&mut self) -> Result<()> {
+    pub fn push_selected(&mut self) {
         let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
         if let Some((name, Some(path))) = info {
-            self.status_message = Some(format!("Pushing {}...", name));
-            git::push(&path).await?;
-            self.refresh().await?;
+            self.set_status(format!("Pushing {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("push {}", name);
+            tokio::spawn(async move {
+                let result = git::push(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Pushed {}", name)
+                    } else {
+                        "Push failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn sync_selected(&mut self) -> Result<()> {
+    pub fn sync_selected(&mut self) {
         let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
         if let Some((name, Some(path))) = info {
-            self.status_message = Some(format!("Syncing {}...", name));
-            git::fetch(&path).await?;
-            git::pull(&path).await?;
-            git::push(&path).await?;
-            self.refresh().await?;
+            self.set_status(format!("Syncing {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("sync {}", name);
+            tokio::spawn(async move {
+                let fetch_res = git::fetch(&path).await;
+                let pull_res = git::pull(&path).await;
+                let push_res = git::push(&path).await;
+                let success = fetch_res.success && pull_res.success && push_res.success;
+                let stderr = if !success {
+                    let mut errs = Vec::new();
+                    if !fetch_res.stderr.is_empty() { errs.push(fetch_res.stderr); }
+                    if !pull_res.stderr.is_empty() { errs.push(pull_res.stderr); }
+                    if !push_res.stderr.is_empty() { errs.push(push_res.stderr); }
+                    Some(errs.join("\n"))
+                } else {
+                    None
+                };
+                let _ = tx.send(TaskResult {
+                    success,
+                    message: if success {
+                        format!("Synced {}", name)
+                    } else {
+                        "Sync failed (E: view errors)".to_string()
+                    },
+                    stderr,
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn clone_selected(&mut self) -> Result<()> {
+    /// Quicksync: fetch, ff-rebase, add all, commit with fixup, push
+    pub fn quicksync_selected(&mut self) {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+        if let Some((name, Some(path))) = info {
+            self.set_status(format!("Quicksyncing {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("quicksync {}", name);
+            tokio::spawn(async move {
+                let result = git::quicksync(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Quicksynced {}", name)
+                    } else {
+                        "Quicksync failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
+        }
+    }
+
+    pub fn clone_selected(&mut self) {
         let info = self.get_selected_repo().and_then(|r| {
             if r.is_remote_only() {
                 r.ssh_url.clone().map(|url| (r.name.clone(), url))
@@ -454,56 +1085,23 @@ impl App {
         });
         if let Some((name, url)) = info {
             let clone_path = get_ghq_path(&self.local_root, &url);
-            self.status_message = Some(format!("Cloning {}...", name));
-            git::clone(&url, &clone_path).await?;
-            self.refresh().await?;
+            self.set_status(format!("Cloning {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("clone {}", name);
+            tokio::spawn(async move {
+                let result = git::clone(&url, &clone_path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Cloned {}", name)
+                    } else {
+                        "Clone failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
-    }
-
-    pub async fn show_diff(&mut self) -> Result<()> {
-        let path = self.get_selected_repo().and_then(|r| r.local_path.clone());
-        if let Some(path) = path {
-            let diff = git::get_diff(&path).await?;
-            let lines: Vec<String> = diff.lines().map(|s| s.to_string()).collect();
-            if !lines.is_empty() {
-                self.popup = Some(Popup::new(PopupType::Diff, lines));
-            } else {
-                self.status_message = Some("No changes to show".to_string());
-            }
-        }
-        Ok(())
-    }
-
-    pub fn start_commit(&mut self) {
-        let is_dirty = self.get_selected_repo()
-            .and_then(|r| r.git_status.as_ref())
-            .map(|s| s.is_dirty())
-            .unwrap_or(false);
-        if is_dirty {
-            self.input_mode = InputMode::Commit;
-            self.input_buffer = "fixup: from ghall".to_string();
-        }
-    }
-
-    pub async fn commit_and_push(&mut self) -> Result<()> {
-        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
-        if let Some((name, Some(path))) = info {
-            let message = if self.input_buffer.is_empty() {
-                "fixup: from ghall".to_string()
-            } else {
-                self.input_buffer.clone()
-            };
-
-            self.status_message = Some(format!("Committing {}...", name));
-            git::add_all(&path).await?;
-            git::commit(&path, &message).await?;
-            git::push(&path).await?;
-
-            self.close_popup();
-            self.refresh().await?;
-        }
-        Ok(())
     }
 
     pub fn start_delete_confirm(&mut self) {
@@ -512,6 +1110,18 @@ impl App {
             .unwrap_or(false);
         if has_local {
             self.input_mode = InputMode::ConfirmDelete;
+            self.pending_delete = Some(DeleteType::LocalRepo);
+            self.confirm_buffer.clear();
+        }
+    }
+
+    pub fn start_delete_remote_confirm(&mut self) {
+        let can_delete = self.get_selected_repo()
+            .map(|r| r.github_url.is_some() && r.is_member)
+            .unwrap_or(false);
+        if can_delete {
+            self.input_mode = InputMode::ConfirmDelete;
+            self.pending_delete = Some(DeleteType::RemoteRepo);
             self.confirm_buffer.clear();
         }
     }
@@ -520,48 +1130,178 @@ impl App {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
             let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
             if let Some((name, Some(path))) = info {
-                self.status_message = Some(format!("Deleting {}...", name));
+                self.set_status(format!("Deleting {}...", name));
                 tokio::fs::remove_dir_all(&path).await?;
                 self.close_popup();
                 self.refresh().await?;
+                self.set_status(format!("Deleted {}", name));
             }
         } else {
             self.close_popup();
         }
+        self.pending_delete = None;
         Ok(())
     }
 
-    pub async fn create_github_repo(&mut self) -> Result<()> {
-        let info = self.get_selected_repo().and_then(|r| {
-            if r.is_local_only() {
-                r.local_path.clone().map(|p| (r.name.clone(), p))
-            } else {
-                None
+    pub async fn delete_remote_repo(&mut self) -> Result<()> {
+        if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
+            let info = self.get_selected_repo().and_then(|r| {
+                r.owner.clone().map(|o| format!("{}/{}", o, r.name))
+            });
+            if let Some(name_with_owner) = info {
+                self.set_status(format!("Deleting remote {}...", name_with_owner));
+                let result = github::delete_repo(&name_with_owner).await;
+                if result.success {
+                    self.close_popup();
+                    self.refresh().await?;
+                    self.set_status(format!("Deleted remote {}", name_with_owner));
+                } else {
+                    self.error_log.push(ErrorLogEntry::new(
+                        format!("delete remote {}", name_with_owner),
+                        &result.stderr,
+                    ));
+                    self.close_popup();
+                    self.set_status(format!("Failed to delete {} (E: view errors)", name_with_owner));
+                }
             }
-        });
-        if let Some((name, path)) = info {
-            self.status_message = Some(format!("Creating GitHub repo for {}...", name));
-            github::create_repo(&name, &path).await?;
-            self.refresh().await?;
+        } else {
+            self.close_popup();
         }
+        self.pending_delete = None;
         Ok(())
     }
 
-    pub async fn toggle_private(&mut self) -> Result<()> {
+    pub fn reorganize_to_ghq(&mut self) {
+        let info = self.get_selected_repo().map(|r| {
+            (
+                r.name.clone(),
+                r.local_path.clone(),
+                r.expected_ghq_path(&self.local_root),
+                r.follows_ghq(&self.local_root),
+            )
+        });
+
+        if let Some((name, Some(current_path), Some(expected_path), Some(false))) = info {
+            self.set_status(format!("Reorganizing {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("reorganize {}", name);
+            tokio::spawn(async move {
+                let result = async {
+                    let src = Path::new(&current_path);
+                    let dst = Path::new(&expected_path);
+
+                    // Create parent directories
+                    if let Some(parent) = dst.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+
+                    // Try simple rename first (works on same filesystem)
+                    match tokio::fs::rename(src, dst).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            // If rename fails (cross-device or target exists), try recursive copy
+                            if e.kind() == std::io::ErrorKind::Other
+                                || e.kind() == std::io::ErrorKind::AlreadyExists
+                                || e.raw_os_error() == Some(18) // EXDEV - cross-device link
+                                || e.raw_os_error() == Some(39) // ENOTEMPTY
+                            {
+                                // Recursive copy using system cp command for reliability
+                                let status = tokio::process::Command::new("cp")
+                                    .args(["-r", &current_path, &expected_path])
+                                    .status()
+                                    .await?;
+
+                                if status.success() {
+                                    // Remove original after successful copy
+                                    tokio::fs::remove_dir_all(src).await?;
+                                    Ok(())
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "cp command failed",
+                                    ))
+                                }
+                            } else {
+                                Err(e)
+                            }
+                        }
+                    }
+                }.await;
+
+                let _ = tx.send(TaskResult {
+                    success: result.is_ok(),
+                    message: if result.is_ok() {
+                        format!("Moved {} to ghq path", name)
+                    } else {
+                        "Move failed (E: view errors)".to_string()
+                    },
+                    stderr: result.err().map(|e| e.to_string()),
+                    operation: op,
+                }).await;
+            });
+        }
+    }
+
+    pub fn toggle_private(&mut self) {
         let info = self.get_selected_repo().and_then(|r| {
             r.owner.clone().map(|o| (format!("{}/{}", o, r.name), r.is_private))
         });
         if let Some((name_with_owner, is_private)) = info {
             let new_visibility = if is_private { "public" } else { "private" };
-            self.status_message = Some(format!("Setting {} to {}...", name_with_owner, new_visibility));
-            github::set_visibility(&name_with_owner, new_visibility).await?;
-            self.refresh().await?;
+            self.set_status(format!("Setting {} to {}...", name_with_owner, new_visibility));
+            let tx = self.task_tx.clone();
+            let name = name_with_owner.clone();
+            let vis = new_visibility.to_string();
+            let op = format!("set visibility {}", name);
+            tokio::spawn(async move {
+                let result = github::set_visibility(&name, &vis).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Set {} to {}", name, vis)
+                    } else {
+                        "Visibility change failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
+    }
+
+    pub fn toggle_archived(&mut self) {
+        let info = self.get_selected_repo().and_then(|r| {
+            if r.is_member {
+                r.owner.clone().map(|o| (format!("{}/{}", o, r.name), r.is_archived))
+            } else {
+                None
+            }
+        });
+        if let Some((name_with_owner, is_archived)) = info {
+            let action = if is_archived { "Unarchiving" } else { "Archiving" };
+            self.set_status(format!("{} {}...", action, name_with_owner));
+            let tx = self.task_tx.clone();
+            let name = name_with_owner.clone();
+            let done = if is_archived { "Unarchived" } else { "Archived" };
+            let op = format!("{} {}", action.to_lowercase(), name);
+            tokio::spawn(async move {
+                let result = github::set_archived(&name, !is_archived).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("{} {}", done, name)
+                    } else {
+                        format!("{} failed (E: view errors)", action)
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
+        }
     }
 
     // Gist operations
-    pub async fn clone_gist(&mut self) -> Result<()> {
+    pub fn clone_gist(&mut self) {
         let info = self.get_selected_gist().and_then(|g| {
             if g.local_path.is_none() {
                 Some(g.id.clone())
@@ -571,17 +1311,30 @@ impl App {
         });
         if let Some(id) = info {
             let clone_path = format!("{}/gists/{}", self.local_root, id);
-            let display_id = &id[..8.min(id.len())];
-            self.status_message = Some(format!("Cloning gist {}...", display_id));
-            github::clone_gist(&id, &clone_path).await?;
-            self.refresh().await?;
+            let display_id = id[..8.min(id.len())].to_string();
+            self.set_status(format!("Cloning gist {}...", display_id));
+            let tx = self.task_tx.clone();
+            let op = format!("clone gist {}", display_id);
+            tokio::spawn(async move {
+                let result = github::clone_gist(&id, &clone_path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Cloned gist {}", display_id)
+                    } else {
+                        "Clone gist failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
     pub fn start_gist_delete_confirm(&mut self) {
         if self.get_selected_gist().is_some() {
             self.input_mode = InputMode::ConfirmDelete;
+            self.pending_delete = Some(DeleteType::Gist);
             self.confirm_buffer.clear();
         }
     }
@@ -590,73 +1343,118 @@ impl App {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
             let id = self.get_selected_gist().map(|g| g.id.clone());
             if let Some(id) = id {
-                self.status_message = Some("Deleting gist...".to_string());
-                github::delete_gist(&id).await?;
-                self.close_popup();
-                self.refresh().await?;
+                let display_id = id[..8.min(id.len())].to_string();
+                self.set_status("Deleting gist...");
+                let result = github::delete_gist(&id).await;
+                if result.success {
+                    self.close_popup();
+                    self.refresh().await?;
+                    self.set_status(format!("Deleted gist {}", display_id));
+                } else {
+                    self.error_log.push(ErrorLogEntry::new(
+                        format!("delete gist {}", display_id),
+                        result.stderr,
+                    ));
+                    self.set_status("Delete failed (E: view errors)");
+                    self.close_popup();
+                }
             }
         } else {
             self.close_popup();
         }
+        self.pending_delete = None;
         Ok(())
     }
 
-    pub async fn pull_gist(&mut self) -> Result<()> {
+    pub fn pull_gist(&mut self) {
         let info = self.get_selected_gist().and_then(|g| {
             g.local_path.clone().map(|p| (g.id.clone(), p))
         });
         if let Some((id, path)) = info {
-            let display_id = &id[..8.min(id.len())];
-            self.status_message = Some(format!("Pulling gist {}...", display_id));
-            git::pull(&path).await?;
-            self.refresh().await?;
+            let display_id = id[..8.min(id.len())].to_string();
+            self.set_status(format!("Pulling gist {}...", display_id));
+            let tx = self.task_tx.clone();
+            let op = format!("pull gist {}", display_id);
+            tokio::spawn(async move {
+                let result = git::pull(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Pulled gist {}", display_id)
+                    } else {
+                        "Pull gist failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn push_gist(&mut self) -> Result<()> {
+    pub fn push_gist(&mut self) {
         let info = self.get_selected_gist().and_then(|g| {
             g.local_path.clone().map(|p| (g.id.clone(), p))
         });
         if let Some((id, path)) = info {
-            let display_id = &id[..8.min(id.len())];
-            self.status_message = Some(format!("Pushing gist {}...", display_id));
-            git::push(&path).await?;
-            self.refresh().await?;
+            let display_id = id[..8.min(id.len())].to_string();
+            self.set_status(format!("Pushing gist {}...", display_id));
+            let tx = self.task_tx.clone();
+            let op = format!("push gist {}", display_id);
+            tokio::spawn(async move {
+                let result = git::push(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Pushed gist {}", display_id)
+                    } else {
+                        "Push gist failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn sync_gist(&mut self) -> Result<()> {
+    pub fn sync_gist(&mut self) {
         let info = self.get_selected_gist().and_then(|g| {
             g.local_path.clone().map(|p| (g.id.clone(), p))
         });
         if let Some((id, path)) = info {
-            let display_id = &id[..8.min(id.len())];
-            self.status_message = Some(format!("Syncing gist {}...", display_id));
-            git::fetch(&path).await?;
-            git::pull(&path).await?;
-            git::push(&path).await?;
-            self.refresh().await?;
+            let display_id = id[..8.min(id.len())].to_string();
+            self.set_status(format!("Syncing gist {}...", display_id));
+            let tx = self.task_tx.clone();
+            let op = format!("sync gist {}", display_id);
+            tokio::spawn(async move {
+                let fetch_res = git::fetch(&path).await;
+                let pull_res = git::pull(&path).await;
+                let push_res = git::push(&path).await;
+                let success = fetch_res.success && pull_res.success && push_res.success;
+                let stderr = if !success {
+                    let mut errs = Vec::new();
+                    if !fetch_res.stderr.is_empty() { errs.push(fetch_res.stderr); }
+                    if !pull_res.stderr.is_empty() { errs.push(pull_res.stderr); }
+                    if !push_res.stderr.is_empty() { errs.push(push_res.stderr); }
+                    Some(errs.join("\n"))
+                } else {
+                    None
+                };
+                let _ = tx.send(TaskResult {
+                    success,
+                    message: if success {
+                        format!("Synced gist {}", display_id)
+                    } else {
+                        "Sync gist failed (E: view errors)".to_string()
+                    },
+                    stderr,
+                    operation: op,
+                }).await;
+            });
         }
-        Ok(())
     }
 
-    pub async fn show_gist_diff(&mut self) -> Result<()> {
-        let path = self.get_selected_gist().and_then(|g| g.local_path.clone());
-        if let Some(path) = path {
-            let diff = git::get_diff(&path).await?;
-            let lines: Vec<String> = diff.lines().map(|s| s.to_string()).collect();
-            if !lines.is_empty() {
-                self.popup = Some(Popup::new(PopupType::Diff, lines));
-            } else {
-                self.status_message = Some("No changes to show".to_string());
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn upload_local_repo(&mut self) -> Result<()> {
+    /// Show upload form for a local-only repo
+    pub fn show_upload_form(&mut self) {
         let info = self.get_selected_repo().and_then(|r| {
             if r.is_local_only() {
                 r.local_path.clone().map(|p| (r.name.clone(), p))
@@ -665,20 +1463,142 @@ impl App {
             }
         });
         if let Some((name, path)) = info {
-            self.status_message = Some(format!("Creating GitHub repo {}...", name));
-            github::create_repo(&name, &path).await?;
-            self.refresh().await?;
+            // Fetch orgs in background and update form when ready
+            let tx = self.task_tx.clone();
+            tokio::spawn(async move {
+                let orgs = github::get_user_orgs().await.unwrap_or_default();
+                // Send orgs as a special message - we'll parse it later
+                let _ = tx.send(TaskResult {
+                    success: true,
+                    message: format!("__ORGS__:{}", orgs.join(",")),
+                    stderr: None,
+                    operation: String::new(),
+                }).await;
+            });
+
+            self.upload_form = Some(UploadFormState {
+                name,
+                description: String::new(),
+                private: true,
+                orgs: Vec::new(), // Will be populated when orgs arrive
+                selected_org: 0,  // 0 = personal account
+                active_field: UploadField::Name,
+                local_path: path,
+            });
+            self.input_mode = InputMode::UploadForm;
+            self.popup = Some(Popup::new(PopupType::Upload, Vec::new()));
         }
-        Ok(())
+    }
+
+    /// Submit the upload form
+    pub fn submit_upload_form(&mut self) {
+        if let Some(form) = self.upload_form.take() {
+            let org = if form.selected_org == 0 {
+                None
+            } else {
+                form.orgs.get(form.selected_org - 1).cloned()
+            };
+
+            let opts = github::CreateRepoOptions {
+                name: form.name.clone(),
+                path: form.local_path.clone(),
+                description: if form.description.is_empty() { None } else { Some(form.description) },
+                private: form.private,
+                org,
+            };
+
+            self.set_status(format!("Creating GitHub repo {}...", opts.name));
+            let tx = self.task_tx.clone();
+            let name = opts.name.clone();
+            let op = format!("create repo {}", name);
+            tokio::spawn(async move {
+                let result = github::create_repo(&opts).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Created {}", name)
+                    } else {
+                        "Create repo failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
+
+            self.close_popup();
+        }
+    }
+
+    /// Cancel upload form
+    pub fn cancel_upload_form(&mut self) {
+        self.upload_form = None;
+        self.close_popup();
+    }
+
+    /// Navigate to next field in upload form
+    pub fn upload_form_next_field(&mut self) {
+        if let Some(ref mut form) = self.upload_form {
+            form.active_field = form.active_field.next();
+        }
+    }
+
+    /// Navigate to previous field in upload form
+    pub fn upload_form_prev_field(&mut self) {
+        if let Some(ref mut form) = self.upload_form {
+            form.active_field = form.active_field.prev();
+        }
+    }
+
+    /// Toggle private field in upload form
+    pub fn upload_form_toggle_private(&mut self) {
+        if let Some(ref mut form) = self.upload_form {
+            form.private = !form.private;
+        }
+    }
+
+    /// Cycle org selection in upload form
+    pub fn upload_form_next_org(&mut self) {
+        if let Some(ref mut form) = self.upload_form {
+            let max = form.orgs.len(); // 0 is personal, then orgs
+            form.selected_org = (form.selected_org + 1) % (max + 1);
+        }
+    }
+
+    pub fn upload_form_prev_org(&mut self) {
+        if let Some(ref mut form) = self.upload_form {
+            let max = form.orgs.len();
+            if form.selected_org == 0 {
+                form.selected_org = max;
+            } else {
+                form.selected_org -= 1;
+            }
+        }
     }
 
     pub fn handle_char(&mut self, c: char) {
         match self.input_mode {
-            InputMode::Commit => {
-                self.input_buffer.push(c);
-            }
             InputMode::ConfirmDelete => {
                 self.confirm_buffer.push(c);
+            }
+            InputMode::UploadForm => {
+                if let Some(ref mut form) = self.upload_form {
+                    match form.active_field {
+                        UploadField::Name => form.name.push(c),
+                        UploadField::Description => form.description.push(c),
+                        UploadField::Private => {
+                            // Space or Enter toggles
+                            if c == ' ' {
+                                form.private = !form.private;
+                            }
+                        }
+                        UploadField::Org => {
+                            // Space cycles org
+                            if c == ' ' {
+                                self.upload_form_next_org();
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -686,11 +1606,17 @@ impl App {
 
     pub fn handle_backspace(&mut self) {
         match self.input_mode {
-            InputMode::Commit => {
-                self.input_buffer.pop();
-            }
             InputMode::ConfirmDelete => {
                 self.confirm_buffer.pop();
+            }
+            InputMode::UploadForm => {
+                if let Some(ref mut form) = self.upload_form {
+                    match form.active_field {
+                        UploadField::Name => { form.name.pop(); }
+                        UploadField::Description => { form.description.pop(); }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -749,8 +1675,11 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
                 is_fork: false,
                 fork_parent: None,
                 is_private: false,
+                is_archived: false,
+                is_member: false,
                 local_path: Some(repo.path),
                 git_status: Some(repo.status),
+                last_commit_time: repo.last_commit_time,
             });
         }
     }
@@ -769,8 +1698,11 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             is_fork: gh_repo.is_fork,
             fork_parent: gh_repo.fork_parent,
             is_private: gh_repo.is_private,
+            is_archived: gh_repo.is_archived,
+            is_member: gh_repo.is_member,
             local_path: local.as_ref().map(|l| l.path.clone()),
-            git_status: local.map(|l| l.status),
+            git_status: local.as_ref().map(|l| l.status.clone()),
+            last_commit_time: local.and_then(|l| l.last_commit_time),
         });
     }
 
@@ -785,8 +1717,11 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             is_fork: false,
             fork_parent: None,
             is_private: false,
+            is_archived: false,
+            is_member: false, // Not from our GitHub query
             local_path: Some(repo.path),
             git_status: Some(repo.status),
+            last_commit_time: repo.last_commit_time,
         });
     }
 
@@ -816,30 +1751,44 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
     match view_mode {
         ViewMode::Repos => vec![
             "HEADER|Navigation".to_string(),
-            "j/↓|Move down|".to_string(),
-            "k/↑|Move up|".to_string(),
-            "g|Switch to Gists view|cyan".to_string(),
+            "↑/↓/j/k|Move up/down|".to_string(),
+            "←/→|Change sort column|".to_string(),
+            "v|Reverse sort direction|".to_string(),
+            ", .|Select prev/next column|".to_string(),
+            "< >|Move column left/right|".to_string(),
+            "Tab|Switch to Gists view|cyan".to_string(),
             "Enter|Show details|".to_string(),
+            "E|Show error log|yellow".to_string(),
+            "y|Copy popup to clipboard|".to_string(),
             "".to_string(),
             "HEADER|Git Actions".to_string(),
-            "l|Pull (fast-forward)|cyan".to_string(),
-            "h|Push to remote|magenta".to_string(),
-            "s|Sync (fetch+pull+push)|green".to_string(),
-            "f|Show diff|yellow".to_string(),
+            "g|Open lazygit|green".to_string(),
+            "l|Pull (ff-only)|cyan".to_string(),
+            "h|Push|magenta".to_string(),
+            "s|Sync (pull+push)|".to_string(),
+            "y|Quicksync (rebase+add+commit+push)|yellow".to_string(),
             "r|Refresh all|".to_string(),
             "".to_string(),
             "HEADER|Repository".to_string(),
             "n|Clone repo (remote-only)|cyan".to_string(),
             "u|Upload local repo to GitHub|magenta".to_string(),
+            "o|Open in browser|".to_string(),
+            "O|Open in file manager|".to_string(),
             "p|Toggle private/public|".to_string(),
+            "P|Show/hide private repos|".to_string(),
+            "a|Toggle archived status|".to_string(),
+            "A|Show/hide archived repos|".to_string(),
             "d|Delete local copy|red".to_string(),
+            "D|Delete remote repo|red".to_string(),
+            "z|Reorganize to ghq path|".to_string(),
             "i|Ignore/hide repo|".to_string(),
             "I|Show ignored repos|".to_string(),
             "".to_string(),
             "HEADER|Type Icons".to_string(),
-            "● src|Original repository|green".to_string(),
+            "● src|Your original repository|green".to_string(),
+            "◌ clone|Clone from other owner|cyan".to_string(),
             "⑂|Fork (shows upstream)|magenta".to_string(),
-            "◌ local|Local clone only|blue".to_string(),
+            "◌ local|Local only (no remote)|blue".to_string(),
             "".to_string(),
             "HEADER|Status Icons".to_string(),
             "✓|Synced with remote|green".to_string(),
@@ -853,16 +1802,14 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
         ],
         ViewMode::Gists => vec![
             "HEADER|Navigation".to_string(),
-            "j/↓|Move down|".to_string(),
-            "k/↑|Move up|".to_string(),
-            "g|Switch to Repos view|cyan".to_string(),
+            "↑/↓/j/k|Move up/down|".to_string(),
+            "Tab|Switch to Repos view|cyan".to_string(),
             "Enter|Show details|".to_string(),
             "".to_string(),
             "HEADER|Git Actions".to_string(),
-            "l|Pull (fast-forward)|cyan".to_string(),
-            "h|Push to remote|magenta".to_string(),
-            "s|Sync (fetch+pull+push)|green".to_string(),
-            "f|Show diff|yellow".to_string(),
+            "l|Pull (not when dirty)|cyan".to_string(),
+            "h|Push (not when dirty)|magenta".to_string(),
+            "s|Sync (not when dirty)|".to_string(),
             "r|Refresh all|".to_string(),
             "".to_string(),
             "HEADER|Gist Actions".to_string(),
@@ -871,5 +1818,46 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "".to_string(),
             "|Press ? or Esc to close|".to_string(),
         ],
+    }
+}
+
+
+// Sorting helpers
+fn repo_type_sort_order(repo: &RepoRow, username: &Option<String>) -> u8 {
+    if repo.is_fork {
+        2 // Fork
+    } else if repo.github_url.is_some() {
+        if let (Some(ref u), Some(ref o)) = (username, &repo.owner) {
+            if u.eq_ignore_ascii_case(o) {
+                0 // Source (owned)
+            } else {
+                1 // Clone (not owned)
+            }
+        } else {
+            1 // Clone
+        }
+    } else {
+        3 // Local only
+    }
+}
+
+fn status_sort_order(repo: &RepoRow) -> u8 {
+    match &repo.git_status {
+        Some(status) => {
+            if status.is_dirty() {
+                0 // Dirty first
+            } else if status.ahead > 0 && status.behind > 0 {
+                1 // Diverged
+            } else if status.ahead > 0 {
+                2 // Ahead
+            } else if status.behind > 0 {
+                3 // Behind
+            } else if !status.has_remote {
+                5 // No remote
+            } else {
+                4 // Synced
+            }
+        }
+        None => 6, // No local
     }
 }

@@ -30,3 +30,10 @@ walkdir = "2"
 
 # Path expansion
 shellexpand = "3"
+
+# Time formatting
+chrono = "0.4"
+
+# Config file
+toml = "0.8"
+dirs = "6"
