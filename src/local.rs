@@ -11,6 +11,8 @@ pub struct LocalRepo {
     pub remote_owner: Option<String>,
     pub remote_url: Option<String>,
     pub last_commit_time: Option<i64>,
+    pub is_subrepo: bool,         // Nested inside another repo
+    pub parent_repo: Option<String>, // Path to parent repo if subrepo
 }
 
 pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
@@ -65,7 +67,24 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
                 remote_owner,
                 remote_url,
                 last_commit_time,
+                is_subrepo: false,
+                parent_repo: None,
             });
+        }
+    }
+
+    // Detect subrepos: repos nested inside other repos
+    // A repo is a subrepo if its path starts with another repo's path + "/"
+    let repo_paths: Vec<String> = repos.iter().map(|r| r.path.clone()).collect();
+    for repo in &mut repos {
+        for other_path in &repo_paths {
+            // Check if this repo's path starts with another repo's path
+            // (but is not the same path)
+            if repo.path != *other_path && repo.path.starts_with(&format!("{}/", other_path)) {
+                repo.is_subrepo = true;
+                repo.parent_repo = Some(other_path.clone());
+                break; // Found the parent, no need to check more
+            }
         }
     }
 

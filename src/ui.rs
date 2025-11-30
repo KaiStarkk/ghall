@@ -256,6 +256,11 @@ fn format_repo_name(repo: &RepoRow) -> Span<'static> {
 }
 
 fn format_type(repo: &RepoRow) -> Line<'static> {
+    // Check if this is a subrepo (nested inside another repo)
+    if repo.is_subrepo {
+        return Line::from(Span::styled("⊂ sub", Style::default().fg(Color::Yellow)));
+    }
+
     // Check if this is a fork
     if repo.is_fork {
         // Fork symbol in purple + upstream owner

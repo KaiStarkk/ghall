@@ -246,6 +246,8 @@ pub struct RepoRow {
     pub local_path: Option<String>,
     pub git_status: Option<RepoStatus>,
     pub last_commit_time: Option<i64>, // Unix timestamp
+    pub is_subrepo: bool,              // Nested inside another repo
+    pub parent_repo: Option<String>,   // Path to parent repo if subrepo
 }
 
 impl RepoRow {
@@ -266,8 +268,16 @@ impl RepoRow {
     }
 
     /// Returns the expected ghq-style path for this repo
+    /// For forks, uses the upstream/source owner instead of the fork owner
     pub fn expected_ghq_path(&self, local_root: &str) -> Option<String> {
-        if let Some(ref owner) = self.owner {
+        // For forks, use the upstream owner; otherwise use the repo owner
+        let effective_owner = if self.is_fork {
+            self.fork_owner().map(|s| s.to_string()).or_else(|| self.owner.clone())
+        } else {
+            self.owner.clone()
+        };
+
+        if let Some(owner) = effective_owner {
             // Canonicalize local_root to get consistent path
             let root = std::path::Path::new(local_root)
                 .canonicalize()
@@ -280,8 +290,16 @@ impl RepoRow {
     }
 
     /// Checks if the current local path follows ghq convention
+    /// For forks, checks against the upstream/source owner path
     pub fn follows_ghq(&self, local_root: &str) -> Option<bool> {
-        if let (Some(ref local_path), Some(ref owner)) = (&self.local_path, &self.owner) {
+        // For forks, use the upstream owner; otherwise use the repo owner
+        let effective_owner = if self.is_fork {
+            self.fork_owner().map(|s| s.to_string()).or_else(|| self.owner.clone())
+        } else {
+            self.owner.clone()
+        };
+
+        if let (Some(ref local_path), Some(owner)) = (&self.local_path, effective_owner) {
             // Check if path matches pattern: {root}/github.com/{owner}/{name}
             // Use case-insensitive comparison and resolve symlinks
             let local = std::path::Path::new(local_path);
@@ -889,6 +907,9 @@ impl App {
 
                     if repo.is_fork {
                         content.push(format!("Fork of: {}", repo.fork_parent.as_deref().unwrap_or("unknown")));
+                    }
+                    if repo.is_subrepo {
+                        content.push(format!("Subrepo of: {}", repo.parent_repo.as_deref().unwrap_or("unknown")));
                     }
                     content.push(format!("Private: {}", if repo.is_private { "yes" } else { "no" }));
 
@@ -1709,6 +1730,8 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
                 local_path: Some(repo.path),
                 git_status: Some(repo.status),
                 last_commit_time: repo.last_commit_time,
+                is_subrepo: repo.is_subrepo,
+                parent_repo: repo.parent_repo,
             });
         }
     }
@@ -1731,7 +1754,9 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             is_member: gh_repo.is_member,
             local_path: local.as_ref().map(|l| l.path.clone()),
             git_status: local.as_ref().map(|l| l.status.clone()),
-            last_commit_time: local.and_then(|l| l.last_commit_time),
+            last_commit_time: local.as_ref().and_then(|l| l.last_commit_time),
+            is_subrepo: local.as_ref().map(|l| l.is_subrepo).unwrap_or(false),
+            parent_repo: local.and_then(|l| l.parent_repo),
         });
     }
 
@@ -1751,6 +1776,8 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             local_path: Some(repo.path),
             git_status: Some(repo.status),
             last_commit_time: repo.last_commit_time,
+            is_subrepo: repo.is_subrepo,
+            parent_repo: repo.parent_repo,
         });
     }
 
@@ -1818,6 +1845,7 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "◌ clone|Clone from other owner|cyan".to_string(),
             "⑂|Fork (shows upstream)|magenta".to_string(),
             "◌ local|Local only (no remote)|blue".to_string(),
+            "⊂ sub|Subrepo (nested in another)|yellow".to_string(),
             "".to_string(),
             "HEADER|Status Icons".to_string(),
             "✓|Synced with remote|green".to_string(),
@@ -1853,7 +1881,10 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
 
 // Sorting helpers
 fn repo_type_sort_order(repo: &RepoRow, username: &Option<String>) -> u8 {
-    if repo.is_fork {
+    // Subrepos are grouped separately at the end
+    if repo.is_subrepo {
+        4 // Subrepo
+    } else if repo.is_fork {
         2 // Fork
     } else if repo.github_url.is_some() {
         if let (Some(ref u), Some(ref o)) = (username, &repo.owner) {
