@@ -634,8 +634,14 @@ impl App {
                     }
                 }
             };
-            // Reverse if descending
-            if ascending { cmp } else { cmp.reverse() }
+            // Apply ascending/descending
+            let primary = if ascending { cmp } else { cmp.reverse() };
+            // Use repo ID as tie-breaker for stable sorting
+            if primary == std::cmp::Ordering::Equal {
+                a.id.cmp(&b.id)
+            } else {
+                primary
+            }
         });
     }
 
