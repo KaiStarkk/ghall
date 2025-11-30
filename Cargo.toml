@@ -37,3 +37,6 @@ chrono = "0.4"
 # Config file
 toml = "0.8"
 dirs = "6"
+
+# Async utilities
+futures = "0.3"

@@ -248,6 +248,8 @@ pub struct RepoRow {
     pub last_commit_time: Option<i64>, // Unix timestamp
     pub is_subrepo: bool,              // Nested inside another repo
     pub parent_repo: Option<String>,   // Path to parent repo if subrepo
+    pub fork_ahead: Option<u32>,       // Commits ahead of upstream (for forks)
+    pub fork_behind: Option<u32>,      // Commits behind upstream (for forks)
 }
 
 impl RepoRow {
@@ -268,16 +270,8 @@ impl RepoRow {
     }
 
     /// Returns the expected ghq-style path for this repo
-    /// For forks, uses the upstream/source owner instead of the fork owner
     pub fn expected_ghq_path(&self, local_root: &str) -> Option<String> {
-        // For forks, use the upstream owner; otherwise use the repo owner
-        let effective_owner = if self.is_fork {
-            self.fork_owner().map(|s| s.to_string()).or_else(|| self.owner.clone())
-        } else {
-            self.owner.clone()
-        };
-
-        if let Some(owner) = effective_owner {
+        if let Some(ref owner) = self.owner {
             // Canonicalize local_root to get consistent path
             let root = std::path::Path::new(local_root)
                 .canonicalize()
@@ -290,16 +284,15 @@ impl RepoRow {
     }
 
     /// Checks if the current local path follows ghq convention
-    /// For forks, checks against the upstream/source owner path
+    /// Subrepos are always considered to follow ghq (they're nested in their parent)
     pub fn follows_ghq(&self, local_root: &str) -> Option<bool> {
-        // For forks, use the upstream owner; otherwise use the repo owner
-        let effective_owner = if self.is_fork {
-            self.fork_owner().map(|s| s.to_string()).or_else(|| self.owner.clone())
-        } else {
-            self.owner.clone()
-        };
+        // Subrepos are always considered as following ghq - they're nested inside
+        // their parent repo which should be organized correctly
+        if self.is_subrepo {
+            return Some(true);
+        }
 
-        if let (Some(ref local_path), Some(owner)) = (&self.local_path, effective_owner) {
+        if let (Some(ref local_path), Some(ref owner)) = (&self.local_path, &self.owner) {
             // Check if path matches pattern: {root}/github.com/{owner}/{name}
             // Use case-insensitive comparison and resolve symlinks
             let local = std::path::Path::new(local_path);
@@ -480,7 +473,11 @@ impl App {
         self.set_status("Refreshing...");
 
         // Fetch GitHub repos via GraphQL
-        let github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
+        let mut github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
+
+        // Fetch fork comparison data (commits ahead/behind upstream)
+        self.set_status("Fetching fork status...");
+        github::fetch_fork_comparisons(&mut github_repos).await;
 
         // Discover local repos
         let local_repos = local::discover_repos(&self.local_root).await?;
@@ -1294,25 +1291,58 @@ impl App {
 
     pub fn toggle_private(&mut self) {
         let info = self.get_selected_repo().and_then(|r| {
-            r.owner.clone().map(|o| (format!("{}/{}", o, r.name), r.is_private))
+            r.owner.clone().map(|o| (format!("{}/{}", o, r.name), r.is_private, r.is_archived))
         });
-        if let Some((name_with_owner, is_private)) = info {
+        if let Some((name_with_owner, is_private, is_archived)) = info {
             let new_visibility = if is_private { "public" } else { "private" };
-            self.set_status(format!("Setting {} to {}...", name_with_owner, new_visibility));
+            let status_msg = if is_archived {
+                format!("Unarchiving, setting {} to {}, then re-archiving...", name_with_owner, new_visibility)
+            } else {
+                format!("Setting {} to {}...", name_with_owner, new_visibility)
+            };
+            self.set_status(status_msg);
             let tx = self.task_tx.clone();
             let name = name_with_owner.clone();
             let vis = new_visibility.to_string();
             let op = format!("set visibility {}", name);
             tokio::spawn(async move {
+                // If archived, unarchive first
+                if is_archived {
+                    let unarchive_result = github::set_archived(&name, false).await;
+                    if !unarchive_result.success {
+                        let _ = tx.send(TaskResult {
+                            success: false,
+                            message: "Failed to unarchive before visibility change (E: view errors)".to_string(),
+                            stderr: Some(unarchive_result.stderr),
+                            operation: op,
+                        }).await;
+                        return;
+                    }
+                }
+
+                // Change visibility
                 let result = github::set_visibility(&name, &vis).await;
+
+                // If was archived, re-archive regardless of visibility result
+                let rearchive_result = if is_archived {
+                    Some(github::set_archived(&name, true).await)
+                } else {
+                    None
+                };
+
+                let (success, message, stderr) = match (result.success, rearchive_result) {
+                    (true, None) => (true, format!("Set {} to {}", name, vis), None),
+                    (true, Some(r)) if r.success => (true, format!("Set {} to {} (re-archived)", name, vis), None),
+                    (true, Some(r)) => (false, format!("Set {} to {} but re-archive failed (E: view errors)", name, vis), Some(r.stderr)),
+                    (false, Some(r)) if r.success => (false, "Visibility change failed, repo re-archived (E: view errors)".to_string(), Some(result.stderr)),
+                    (false, Some(r)) => (false, "Visibility change failed, re-archive also failed (E: view errors)".to_string(), Some(format!("{}\n\nRe-archive error:\n{}", result.stderr, r.stderr))),
+                    (false, None) => (false, "Visibility change failed (E: view errors)".to_string(), Some(result.stderr)),
+                };
+
                 let _ = tx.send(TaskResult {
-                    success: result.success,
-                    message: if result.success {
-                        format!("Set {} to {}", name, vis)
-                    } else {
-                        "Visibility change failed (E: view errors)".to_string()
-                    },
-                    stderr: if result.success { None } else { Some(result.stderr) },
+                    success,
+                    message,
+                    stderr,
                     operation: op,
                 }).await;
             });
@@ -1732,6 +1762,8 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
                 last_commit_time: repo.last_commit_time,
                 is_subrepo: repo.is_subrepo,
                 parent_repo: repo.parent_repo,
+                fork_ahead: None,
+                fork_behind: None,
             });
         }
     }
@@ -1740,6 +1772,12 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
     for gh_repo in github_repos {
         let normalized_url = normalize_github_url(&gh_repo.url);
         let local = local_by_url.remove(&normalized_url);
+
+        // Use local commit time if available, otherwise use GitHub's pushed_at
+        let last_commit_time = local
+            .as_ref()
+            .and_then(|l| l.last_commit_time)
+            .or(gh_repo.pushed_at);
 
         result.push(RepoRow {
             id: normalized_url,
@@ -1754,9 +1792,11 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             is_member: gh_repo.is_member,
             local_path: local.as_ref().map(|l| l.path.clone()),
             git_status: local.as_ref().map(|l| l.status.clone()),
-            last_commit_time: local.as_ref().and_then(|l| l.last_commit_time),
+            last_commit_time,
             is_subrepo: local.as_ref().map(|l| l.is_subrepo).unwrap_or(false),
             parent_repo: local.and_then(|l| l.parent_repo),
+            fork_ahead: gh_repo.fork_ahead,
+            fork_behind: gh_repo.fork_behind,
         });
     }
 
@@ -1778,6 +1818,8 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             last_commit_time: repo.last_commit_time,
             is_subrepo: repo.is_subrepo,
             parent_repo: repo.parent_repo,
+            fork_ahead: None,
+            fork_behind: None,
         });
     }
 

@@ -263,13 +263,38 @@ fn format_type(repo: &RepoRow) -> Line<'static> {
 
     // Check if this is a fork
     if repo.is_fork {
-        // Fork symbol in purple + upstream owner
+        // Fork symbol in purple + upstream owner + ahead/behind status
         let mut spans = vec![Span::styled("⑂ ", Style::default().fg(Color::Magenta))];
         if let Some(parent_owner) = repo.fork_owner() {
             spans.push(Span::styled(
-                truncate(parent_owner, 14),
+                truncate(parent_owner, 10),
                 Style::default().fg(Color::Magenta),
             ));
+        }
+        // Add fork sync status if available
+        match (repo.fork_ahead, repo.fork_behind) {
+            (Some(ahead), Some(behind)) if ahead > 0 && behind > 0 => {
+                spans.push(Span::styled(
+                    format!(" ⇅{}/{}", ahead, behind),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            (Some(ahead), _) if ahead > 0 => {
+                spans.push(Span::styled(
+                    format!(" ↑{}", ahead),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            (_, Some(behind)) if behind > 0 => {
+                spans.push(Span::styled(
+                    format!(" ↓{}", behind),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            (Some(0), Some(0)) => {
+                spans.push(Span::styled(" ✓", Style::default().fg(Color::Green)));
+            }
+            _ => {} // No data yet
         }
         return Line::from(spans);
     }

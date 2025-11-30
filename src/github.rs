@@ -1,6 +1,7 @@
 use crate::app::GistRow;
 use crate::git;
 use anyhow::Result;
+use chrono::DateTime;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,6 +9,13 @@ use tokio::process::Command;
 
 /// SSH command that auto-accepts new host keys (but rejects changed ones for security)
 const SSH_COMMAND: &str = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes";
+
+/// Parse ISO 8601 timestamp string to Unix timestamp
+fn parse_iso8601_timestamp(s: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
 
 /// Result of a GitHub CLI operation with captured output
 #[derive(Debug, Clone)]
@@ -36,7 +44,12 @@ pub struct GitHubRepoInfo {
     pub is_fork: bool,
     pub is_archived: bool,
     pub fork_parent: Option<String>,
-    pub is_member: bool, // User owns or is member of org
+    pub is_member: bool,              // User owns or is member of org
+    pub fork_ahead: Option<u32>,      // Commits ahead of upstream (for forks)
+    pub fork_behind: Option<u32>,     // Commits behind upstream (for forks)
+    pub default_branch: Option<String>,        // Default branch name
+    pub parent_default_branch: Option<String>, // Parent's default branch (for forks)
+    pub pushed_at: Option<i64>,       // Last push timestamp (Unix)
 }
 
 // GraphQL response types
@@ -76,13 +89,24 @@ struct Repository {
     is_fork: bool,
     #[serde(rename = "isArchived")]
     is_archived: bool,
+    #[serde(rename = "pushedAt")]
+    pushed_at: Option<String>,
     parent: Option<ParentRepo>,
+    #[serde(rename = "defaultBranchRef")]
+    default_branch_ref: Option<BranchRef>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ParentRepo {
     #[serde(rename = "nameWithOwner")]
     name_with_owner: String,
+    #[serde(rename = "defaultBranchRef")]
+    default_branch_ref: Option<BranchRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchRef {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,7 +151,9 @@ query {
         isPrivate
         isFork
         isArchived
-        parent { nameWithOwner }
+        pushedAt
+        defaultBranchRef { name }
+        parent { nameWithOwner defaultBranchRef { name } }
       }
     }
     organizations(first: 50) {
@@ -142,7 +168,9 @@ query {
             isPrivate
             isFork
             isArchived
-            parent { nameWithOwner }
+            pushedAt
+            defaultBranchRef { name }
+            parent { nameWithOwner defaultBranchRef { name } }
           }
         }
       }
@@ -176,6 +204,13 @@ pub async fn fetch_all_repos_graphql() -> Result<Vec<GitHubRepoInfo>> {
             .unwrap_or(&data.viewer.login)
             .to_string();
 
+        let default_branch = repo.default_branch_ref.as_ref().map(|b| b.name.clone());
+        let (fork_parent, parent_default_branch) = match repo.parent {
+            Some(p) => (Some(p.name_with_owner), p.default_branch_ref.map(|b| b.name)),
+            None => (None, None),
+        };
+        let pushed_at = repo.pushed_at.as_deref().and_then(parse_iso8601_timestamp);
+
         repos.push(GitHubRepoInfo {
             name: repo.name,
             owner,
@@ -184,14 +219,26 @@ pub async fn fetch_all_repos_graphql() -> Result<Vec<GitHubRepoInfo>> {
             is_private: repo.is_private,
             is_fork: repo.is_fork,
             is_archived: repo.is_archived,
-            fork_parent: repo.parent.map(|p| p.name_with_owner),
+            fork_parent,
             is_member: true, // User's own repos
+            fork_ahead: None,
+            fork_behind: None,
+            default_branch,
+            parent_default_branch,
+            pushed_at,
         });
     }
 
     // Add org repos
     for org in data.viewer.organizations.nodes {
         for repo in org.repositories.nodes {
+            let default_branch = repo.default_branch_ref.as_ref().map(|b| b.name.clone());
+            let (fork_parent, parent_default_branch) = match repo.parent {
+                Some(p) => (Some(p.name_with_owner), p.default_branch_ref.map(|b| b.name)),
+                None => (None, None),
+            };
+            let pushed_at = repo.pushed_at.as_deref().and_then(parse_iso8601_timestamp);
+
             repos.push(GitHubRepoInfo {
                 name: repo.name,
                 owner: org.login.clone(),
@@ -200,8 +247,13 @@ pub async fn fetch_all_repos_graphql() -> Result<Vec<GitHubRepoInfo>> {
                 is_private: repo.is_private,
                 is_fork: repo.is_fork,
                 is_archived: repo.is_archived,
-                fork_parent: repo.parent.map(|p| p.name_with_owner),
+                fork_parent,
                 is_member: true, // User is member of org
+                fork_ahead: None,
+                fork_behind: None,
+                default_branch,
+                parent_default_branch,
+                pushed_at,
             });
         }
     }
@@ -424,4 +476,76 @@ pub async fn get_current_user() -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Compare response from GitHub API
+#[derive(Debug, Deserialize)]
+struct CompareResponse {
+    ahead_by: u32,
+    behind_by: u32,
+}
+
+/// Fetch fork comparison data for all forks in the list
+/// Updates fork_ahead and fork_behind fields in place
+pub async fn fetch_fork_comparisons(repos: &mut Vec<GitHubRepoInfo>) {
+    use futures::future::join_all;
+
+    // Collect indices of forks that need comparison
+    let fork_indices: Vec<usize> = repos
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_fork && r.fork_parent.is_some())
+        .map(|(i, _)| i)
+        .collect();
+
+    if fork_indices.is_empty() {
+        return;
+    }
+
+    // Build comparison requests
+    let requests: Vec<_> = fork_indices
+        .iter()
+        .filter_map(|&i| {
+            let repo = &repos[i];
+            let parent = repo.fork_parent.as_ref()?;
+            let fork_branch = repo.default_branch.as_ref()?;
+            let parent_branch = repo.parent_default_branch.as_ref()?;
+
+            // API endpoint: repos/{upstream}/compare/{base}...{head}
+            // Compare upstream's branch to our fork's branch
+            let endpoint = format!(
+                "repos/{}/compare/{}...{}:{}",
+                parent, parent_branch, repo.owner, fork_branch
+            );
+            Some((i, endpoint))
+        })
+        .collect();
+
+    // Execute all comparisons in parallel
+    let futures: Vec<_> = requests
+        .iter()
+        .map(|(_, endpoint)| async {
+            let output = Command::new("gh")
+                .args(["api", endpoint, "--jq", "{ahead_by, behind_by}"])
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    serde_json::from_slice::<CompareResponse>(&out.stdout).ok()
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    // Update repos with comparison data
+    for ((idx, _), result) in requests.iter().zip(results) {
+        if let Some(compare) = result {
+            repos[*idx].fork_ahead = Some(compare.ahead_by);
+            repos[*idx].fork_behind = Some(compare.behind_by);
+        }
+    }
 }
