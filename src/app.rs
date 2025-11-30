@@ -268,7 +268,12 @@ impl RepoRow {
     /// Returns the expected ghq-style path for this repo
     pub fn expected_ghq_path(&self, local_root: &str) -> Option<String> {
         if let Some(ref owner) = self.owner {
-            Some(format!("{}/github.com/{}/{}", local_root, owner, self.name))
+            // Canonicalize local_root to get consistent path
+            let root = std::path::Path::new(local_root)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| local_root.trim_end_matches('/').to_string());
+            Some(format!("{}/github.com/{}/{}", root, owner, self.name))
         } else {
             None
         }
@@ -280,19 +285,25 @@ impl RepoRow {
             // Check if path matches pattern: {root}/github.com/{owner}/{name}
             // Use case-insensitive comparison and resolve symlinks
             let local = std::path::Path::new(local_path);
-            let canonical = local.canonicalize().ok();
-            let path_to_check = canonical.as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| local_path.clone());
 
-            // Also canonicalize local_root
-            let root_canonical = std::path::Path::new(local_root)
+            // Canonicalize the actual local path
+            let path_to_check = match local.canonicalize() {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => local_path.clone(),
+            };
+
+            // Canonicalize local_root
+            let root_canonical = match std::path::Path::new(local_root).canonicalize() {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => local_root.trim_end_matches('/').to_string(),
+            };
+
+            // Build expected path and canonicalize it too
+            let expected_raw = format!("{}/github.com/{}/{}", root_canonical, owner, self.name);
+            let expected = std::path::Path::new(&expected_raw)
                 .canonicalize()
-                .ok()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| local_root.to_string());
-
-            let expected = format!("{}/github.com/{}/{}", root_canonical, owner, self.name);
+                .unwrap_or(expected_raw);
 
             // Compare paths (case-insensitive for owner/name on case-insensitive filesystems)
             Some(path_to_check.eq_ignore_ascii_case(&expected) || path_to_check == expected)
@@ -1182,6 +1193,24 @@ impl App {
         });
 
         if let Some((name, Some(current_path), Some(expected_path), Some(false))) = info {
+            // Safety check: canonicalize both paths and compare to avoid copying directory to itself
+            let src_canonical = Path::new(&current_path).canonicalize();
+            let dst_canonical = Path::new(&expected_path).canonicalize();
+
+            // If both paths canonicalize to the same location, repo is already in place
+            if let (Ok(src), Ok(dst)) = (&src_canonical, &dst_canonical) {
+                if src == dst {
+                    self.set_status(format!("{} is already in ghq path", name));
+                    return;
+                }
+            }
+
+            // If destination already exists (but isn't the same as source), don't overwrite
+            if dst_canonical.is_ok() {
+                self.set_status(format!("Destination already exists for {}", name));
+                return;
+            }
+
             self.set_status(format!("Reorganizing {}...", name));
             let tx = self.task_tx.clone();
             let op = format!("reorganize {}", name);
