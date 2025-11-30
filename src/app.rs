@@ -472,6 +472,10 @@ impl App {
     pub async fn refresh(&mut self) -> Result<()> {
         self.set_status("Refreshing...");
 
+        // Remember current selection to restore after refresh
+        let selected_repo_id = self.get_selected_repo().map(|r| r.id.clone());
+        let selected_gist_id = self.get_selected_gist().map(|g| g.id.clone());
+
         // Fetch GitHub repos via GraphQL
         let mut github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
 
@@ -491,10 +495,33 @@ impl App {
         // Fetch gists
         self.gists = github::fetch_gists_as_rows(&self.local_root).await.unwrap_or_default();
 
-        // Reset selection if out of bounds
-        let max = self.visible_list_len().saturating_sub(1);
-        if self.selected > max {
-            self.selected = max;
+        // Restore selection to the same repo/gist if still present
+        match self.view_mode {
+            ViewMode::Repos => {
+                if let Some(ref id) = selected_repo_id {
+                    if let Some(pos) = self.visible_repos().iter().position(|r| &r.id == id) {
+                        self.selected = pos;
+                    } else {
+                        // Repo no longer visible, clamp selection
+                        let max = self.visible_list_len().saturating_sub(1);
+                        if self.selected > max {
+                            self.selected = max;
+                        }
+                    }
+                }
+            }
+            ViewMode::Gists => {
+                if let Some(ref id) = selected_gist_id {
+                    if let Some(pos) = self.gists.iter().position(|g| &g.id == id) {
+                        self.selected = pos;
+                    } else {
+                        let max = self.visible_list_len().saturating_sub(1);
+                        if self.selected > max {
+                            self.selected = max;
+                        }
+                    }
+                }
+            }
         }
 
         self.clear_status();
@@ -1155,49 +1182,63 @@ impl App {
         }
     }
 
-    pub async fn delete_local_repo(&mut self) -> Result<()> {
+    pub fn delete_local_repo(&mut self) {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
             let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
             if let Some((name, Some(path))) = info {
                 self.set_status(format!("Deleting {}...", name));
-                tokio::fs::remove_dir_all(&path).await?;
+                let tx = self.task_tx.clone();
+                let op = format!("delete local {}", name);
+                tokio::spawn(async move {
+                    let result = tokio::fs::remove_dir_all(&path).await;
+                    let _ = tx.send(TaskResult {
+                        success: result.is_ok(),
+                        message: if result.is_ok() {
+                            format!("Deleted {}", name)
+                        } else {
+                            format!("Failed to delete {}", name)
+                        },
+                        stderr: result.err().map(|e| e.to_string()),
+                        operation: op,
+                    });
+                });
                 self.close_popup();
-                self.refresh().await?;
-                self.set_status(format!("Deleted {}", name));
             }
         } else {
             self.close_popup();
         }
         self.pending_delete = None;
-        Ok(())
     }
 
-    pub async fn delete_remote_repo(&mut self) -> Result<()> {
+    pub fn delete_remote_repo(&mut self) {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
             let info = self.get_selected_repo().and_then(|r| {
                 r.owner.clone().map(|o| format!("{}/{}", o, r.name))
             });
             if let Some(name_with_owner) = info {
                 self.set_status(format!("Deleting remote {}...", name_with_owner));
-                let result = github::delete_repo(&name_with_owner).await;
-                if result.success {
-                    self.close_popup();
-                    self.refresh().await?;
-                    self.set_status(format!("Deleted remote {}", name_with_owner));
-                } else {
-                    self.error_log.push(ErrorLogEntry::new(
-                        format!("delete remote {}", name_with_owner),
-                        &result.stderr,
-                    ));
-                    self.close_popup();
-                    self.set_status(format!("Failed to delete {} (E: view errors)", name_with_owner));
-                }
+                let tx = self.task_tx.clone();
+                let name = name_with_owner.clone();
+                let op = format!("delete remote {}", name);
+                tokio::spawn(async move {
+                    let result = github::delete_repo(&name).await;
+                    let _ = tx.send(TaskResult {
+                        success: result.success,
+                        message: if result.success {
+                            format!("Deleted remote {}", name)
+                        } else {
+                            format!("Failed to delete {} (E: view errors)", name)
+                        },
+                        stderr: Some(result.stderr),
+                        operation: op,
+                    });
+                });
+                self.close_popup();
             }
         } else {
             self.close_popup();
         }
         self.pending_delete = None;
-        Ok(())
     }
 
     pub fn reorganize_to_ghq(&mut self) {
@@ -1419,31 +1460,34 @@ impl App {
         }
     }
 
-    pub async fn delete_gist(&mut self) -> Result<()> {
+    pub fn delete_gist(&mut self) {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
             let id = self.get_selected_gist().map(|g| g.id.clone());
             if let Some(id) = id {
                 let display_id = id[..8.min(id.len())].to_string();
-                self.set_status("Deleting gist...");
-                let result = github::delete_gist(&id).await;
-                if result.success {
-                    self.close_popup();
-                    self.refresh().await?;
-                    self.set_status(format!("Deleted gist {}", display_id));
-                } else {
-                    self.error_log.push(ErrorLogEntry::new(
-                        format!("delete gist {}", display_id),
-                        result.stderr,
-                    ));
-                    self.set_status("Delete failed (E: view errors)");
-                    self.close_popup();
-                }
+                self.set_status(format!("Deleting gist {}...", display_id));
+                let tx = self.task_tx.clone();
+                let op = format!("delete gist {}", display_id);
+                let gist_id = id.clone();
+                tokio::spawn(async move {
+                    let result = github::delete_gist(&gist_id).await;
+                    let _ = tx.send(TaskResult {
+                        success: result.success,
+                        message: if result.success {
+                            format!("Deleted gist {}", display_id)
+                        } else {
+                            format!("Failed to delete gist {} (E: view errors)", display_id)
+                        },
+                        stderr: Some(result.stderr),
+                        operation: op,
+                    });
+                });
+                self.close_popup();
             }
         } else {
             self.close_popup();
         }
         self.pending_delete = None;
-        Ok(())
     }
 
     pub fn pull_gist(&mut self) {

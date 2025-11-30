@@ -116,7 +116,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
                                 }
                             }
                             InputMode::ConfirmDelete => {
-                                handle_confirm_delete_mode(app, key.code).await?;
+                                handle_confirm_delete_mode(app, key.code);
                             }
                             InputMode::UploadForm => {
                                 handle_upload_form_mode(app, key.code);
@@ -418,7 +418,7 @@ async fn handle_gists_action(app: &mut App, code: KeyCode) -> Result<()> {
     Ok(())
 }
 
-async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> Result<()> {
+fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc => {
             app.pending_delete = None;
@@ -426,9 +426,9 @@ async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> Result<()> 
         }
         KeyCode::Enter => {
             match app.pending_delete {
-                Some(DeleteType::LocalRepo) => app.delete_local_repo().await?,
-                Some(DeleteType::RemoteRepo) => app.delete_remote_repo().await?,
-                Some(DeleteType::Gist) => app.delete_gist().await?,
+                Some(DeleteType::LocalRepo) => app.delete_local_repo(),
+                Some(DeleteType::RemoteRepo) => app.delete_remote_repo(),
+                Some(DeleteType::Gist) => app.delete_gist(),
                 None => app.close_popup(),
             }
         }
@@ -436,7 +436,6 @@ async fn handle_confirm_delete_mode(app: &mut App, code: KeyCode) -> Result<()> 
         KeyCode::Backspace => app.handle_backspace(),
         _ => {}
     }
-    Ok(())
 }
 
 fn handle_upload_form_mode(app: &mut App, code: KeyCode) {
