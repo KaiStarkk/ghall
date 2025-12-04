@@ -41,8 +41,8 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app and run
-    let mut app = App::new(path).await?;
+    // Create app and run (App::new is now synchronous, refresh happens in event loop)
+    let mut app = App::new(path)?;
     let res = run_app(&mut terminal, &mut app).await;
 
     // Restore terminal
@@ -96,10 +96,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
         // Check for completed background tasks
         app.poll_tasks();
 
+        // Check for completed refresh data
+        app.poll_refresh();
+
         // Handle pending refresh from background tasks
         if app.pending_refresh {
             app.pending_refresh = false;
-            app.refresh().await?;
+            app.trigger_refresh();
         }
 
         terminal.draw(|f| ui::draw(f, app))?;
@@ -211,7 +214,7 @@ async fn handle_normal_mode<B: Backend>(terminal: &mut Terminal<B>, app: &mut Ap
         KeyCode::Char('E') => app.show_error_log(),
 
         // Refresh
-        KeyCode::Char('r') => app.refresh().await?,
+        KeyCode::Char('r') => app.trigger_refresh(),
 
         // Details popup
         KeyCode::Enter => app.show_details(),
@@ -228,7 +231,7 @@ async fn handle_normal_mode<B: Backend>(terminal: &mut Terminal<B>, app: &mut Ap
                 ViewMode::Repos => {
                     if let Some(lazygit_path) = handle_repos_action(app, code).await? {
                         spawn_lazygit(terminal, &lazygit_path)?;
-                        app.refresh().await?;
+                        app.trigger_refresh();
                     }
                 }
                 ViewMode::Gists => handle_gists_action(app, code).await?,

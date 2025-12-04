@@ -378,6 +378,7 @@ pub struct App {
     // UI state
     pub status_message: Option<String>,
     pub status_time: Option<Instant>,
+    pub status_is_loading: bool, // true = show spinner, false = show tick
     pub input_mode: InputMode,
     pub popup: Option<Popup>,
     pub input_buffer: String,
@@ -393,6 +394,8 @@ pub struct App {
     // Background task communication
     pub task_rx: mpsc::Receiver<TaskResult>,
     pub task_tx: mpsc::Sender<TaskResult>,
+    pub refresh_rx: mpsc::Receiver<RefreshData>,
+    pub refresh_tx: mpsc::Sender<RefreshData>,
     pub pending_refresh: bool,
 
     // Upload form state
@@ -410,16 +413,48 @@ pub struct TaskResult {
     pub operation: String,      // Operation name for error log
 }
 
-impl App {
-    pub async fn new(local_root: String) -> Result<Self> {
-        // Fetch github username
-        let github_username = github::get_current_user().await.ok();
+/// Data loaded from a refresh operation
+pub struct RefreshData {
+    pub github_username: Option<String>,
+    pub repos: Vec<RepoRow>,
+    pub gists: Vec<GistRow>,
+}
 
+/// Perform a full data refresh (runs in background task)
+async fn perform_refresh(local_root: String) -> RefreshData {
+    // Fetch GitHub username
+    let github_username = github::get_current_user().await.ok();
+
+    // Fetch GitHub repos via GraphQL
+    let mut github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
+
+    // Fetch fork comparison data (commits ahead/behind upstream)
+    github::fetch_fork_comparisons(&mut github_repos).await;
+
+    // Discover local repos
+    let local_repos = local::discover_repos(&local_root).await.unwrap_or_default();
+
+    // Merge into unified list
+    let repos = merge_repos(github_repos, local_repos);
+
+    // Fetch gists
+    let gists = github::fetch_gists_as_rows(&local_root).await.unwrap_or_default();
+
+    RefreshData {
+        github_username,
+        repos,
+        gists,
+    }
+}
+
+impl App {
+    pub fn new(local_root: String) -> Result<Self> {
         // Load config from XDG config
         let config = Config::load();
 
         // Create channel for background task results
         let (task_tx, task_rx) = mpsc::channel(32);
+        let (refresh_tx, refresh_rx) = mpsc::channel(1);
 
         // Initialize settings from config
         let sort_column = SortColumn::from_string(&config.sort_column);
@@ -427,10 +462,10 @@ impl App {
         let show_archived = config.show_archived;
         let show_private = config.show_private;
 
-        let mut app = Self {
-            local_root,
+        let app = Self {
+            local_root: local_root.clone(),
             view_mode: ViewMode::Repos,
-            github_username,
+            github_username: None, // Will be fetched during first refresh
             repos: Vec::new(),
             gists: Vec::new(),
             config,
@@ -443,6 +478,7 @@ impl App {
             selected_column: 0,
             status_message: Some("Loading...".to_string()),
             status_time: Some(Instant::now()),
+            status_is_loading: true,
             input_mode: InputMode::Normal,
             popup: None,
             input_buffer: String::new(),
@@ -452,13 +488,18 @@ impl App {
             spinner_frame: 0,
             task_rx,
             task_tx,
+            refresh_rx,
+            refresh_tx: refresh_tx.clone(),
             pending_refresh: false,
             upload_form: None,
             error_log: Vec::new(),
         };
 
-        app.refresh().await?;
-        app.status_message = None;
+        // Spawn initial refresh in background
+        tokio::spawn(async move {
+            let refresh_data = perform_refresh(local_root).await;
+            let _ = refresh_tx.send(refresh_data).await;
+        });
 
         Ok(app)
     }
@@ -469,63 +510,16 @@ impl App {
         repo.github_url.is_some() && repo.is_member
     }
 
-    pub async fn refresh(&mut self) -> Result<()> {
+    /// Trigger a background refresh (non-blocking)
+    pub fn trigger_refresh(&mut self) {
         self.set_status("Refreshing...");
+        let local_root = self.local_root.clone();
+        let tx = self.refresh_tx.clone();
 
-        // Remember current selection to restore after refresh
-        let selected_repo_id = self.get_selected_repo().map(|r| r.id.clone());
-        let selected_gist_id = self.get_selected_gist().map(|g| g.id.clone());
-
-        // Fetch GitHub repos via GraphQL
-        let mut github_repos = github::fetch_all_repos_graphql().await.unwrap_or_default();
-
-        // Fetch fork comparison data (commits ahead/behind upstream)
-        self.set_status("Fetching fork status...");
-        github::fetch_fork_comparisons(&mut github_repos).await;
-
-        // Discover local repos
-        let local_repos = local::discover_repos(&self.local_root).await?;
-
-        // Merge into unified list
-        self.repos = merge_repos(github_repos, local_repos);
-
-        // Re-apply user's sort settings (merge_repos does default sort)
-        self.sort_repos();
-
-        // Fetch gists
-        self.gists = github::fetch_gists_as_rows(&self.local_root).await.unwrap_or_default();
-
-        // Restore selection to the same repo/gist if still present
-        match self.view_mode {
-            ViewMode::Repos => {
-                if let Some(ref id) = selected_repo_id {
-                    if let Some(pos) = self.visible_repos().iter().position(|r| &r.id == id) {
-                        self.selected = pos;
-                    } else {
-                        // Repo no longer visible, clamp selection
-                        let max = self.visible_list_len().saturating_sub(1);
-                        if self.selected > max {
-                            self.selected = max;
-                        }
-                    }
-                }
-            }
-            ViewMode::Gists => {
-                if let Some(ref id) = selected_gist_id {
-                    if let Some(pos) = self.gists.iter().position(|g| &g.id == id) {
-                        self.selected = pos;
-                    } else {
-                        let max = self.visible_list_len().saturating_sub(1);
-                        if self.selected > max {
-                            self.selected = max;
-                        }
-                    }
-                }
-            }
-        }
-
-        self.clear_status();
-        Ok(())
+        tokio::spawn(async move {
+            let refresh_data = perform_refresh(local_root).await;
+            let _ = tx.send(refresh_data).await;
+        });
     }
 
     pub fn toggle_view_mode(&mut self) {
@@ -675,13 +669,15 @@ impl App {
     /// Advance the spinner frame and check for status message timeout
     pub fn tick_spinner(&mut self) {
         if self.status_message.is_some() {
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            // Only animate spinner if we're in loading state
+            if self.status_is_loading {
+                self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            }
 
-            // Clear status message after 2 seconds (for non-loading messages)
-            if let Some(time) = self.status_time {
-                if time.elapsed().as_secs() >= 2 {
-                    // Don't clear if message contains "..." (still loading)
-                    if !self.status_message.as_ref().map(|m| m.contains("...")).unwrap_or(false) {
+            // Clear status message after 2 seconds if not loading
+            if !self.status_is_loading {
+                if let Some(time) = self.status_time {
+                    if time.elapsed().as_secs() >= 2 {
                         self.status_message = None;
                         self.status_time = None;
                     }
@@ -714,8 +710,32 @@ impl App {
                 }
             }
 
-            self.set_status(result.message);
+            // Set status as completed (will show tick instead of spinner)
+            self.set_status_completed(result.message);
             self.pending_refresh = true;
+        }
+    }
+
+    /// Check for completed refresh data (non-blocking)
+    pub fn poll_refresh(&mut self) {
+        while let Ok(data) = self.refresh_rx.try_recv() {
+            // Update app state with refreshed data
+            if data.github_username.is_some() {
+                self.github_username = data.github_username;
+            }
+            self.repos = data.repos;
+            self.gists = data.gists;
+
+            // Re-apply user's sort settings
+            self.sort_repos();
+
+            // Clamp selection to valid range
+            let max = self.visible_list_len().saturating_sub(1);
+            if self.selected > max {
+                self.selected = max;
+            }
+
+            self.set_status_completed(format!("Loaded {} repos", self.repos.len()));
         }
     }
 
@@ -747,16 +767,25 @@ impl App {
         SPINNER_FRAMES[self.spinner_frame]
     }
 
-    /// Set a status message with auto-clear timer
+    /// Set a status message for loading operations (shows spinner)
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
         self.status_time = Some(Instant::now());
+        self.status_is_loading = true;
+    }
+
+    /// Set a status message for completed operations (shows tick, auto-clears)
+    pub fn set_status_completed(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_time = Some(Instant::now());
+        self.status_is_loading = false;
     }
 
     /// Clear status message
     pub fn clear_status(&mut self) {
         self.status_message = None;
         self.status_time = None;
+        self.status_is_loading = false;
     }
 
     /// Toggle sort direction
@@ -1140,7 +1169,8 @@ impl App {
     pub fn clone_selected(&mut self) {
         let info = self.get_selected_repo().and_then(|r| {
             if r.is_remote_only() {
-                r.ssh_url.clone().map(|url| (r.name.clone(), url))
+                // Use HTTPS URL for cloning (works with gh CLI auth)
+                r.github_url.clone().map(|url| (r.name.clone(), url))
             } else {
                 None
             }
@@ -1206,7 +1236,7 @@ impl App {
                         },
                         stderr: result.err().map(|e| e.to_string()),
                         operation: op,
-                    });
+                    }).await;
                 });
                 self.close_popup();
             }
@@ -1237,7 +1267,7 @@ impl App {
                         },
                         stderr: Some(result.stderr),
                         operation: op,
-                    });
+                    }).await;
                 });
                 self.close_popup();
             }
@@ -1486,7 +1516,7 @@ impl App {
                         },
                         stderr: Some(result.stderr),
                         operation: op,
-                    });
+                    }).await;
                 });
                 self.close_popup();
             }
