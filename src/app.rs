@@ -237,6 +237,7 @@ pub struct RepoRow {
     pub owner: Option<String>,
     pub name: String,
     pub github_url: Option<String>,
+    #[allow(dead_code)]
     pub ssh_url: Option<String>,
     pub is_fork: bool,
     pub fork_parent: Option<String>,
@@ -250,6 +251,7 @@ pub struct RepoRow {
     pub parent_repo: Option<String>,   // Path to parent repo if subrepo
     pub fork_ahead: Option<u32>,       // Commits ahead of upstream (for forks)
     pub fork_behind: Option<u32>,      // Commits behind upstream (for forks)
+    pub has_git: bool,                 // Whether this folder has a git repo
 }
 
 impl RepoRow {
@@ -782,6 +784,7 @@ impl App {
     }
 
     /// Clear status message
+    #[allow(dead_code)]
     pub fn clear_status(&mut self) {
         self.status_message = None;
         self.status_time = None;
@@ -1188,6 +1191,28 @@ impl App {
                         format!("Cloned {}", name)
                     } else {
                         "Clone failed (E: view errors)".to_string()
+                    },
+                    stderr: if result.success { None } else { Some(result.stderr) },
+                    operation: op,
+                }).await;
+            });
+        }
+    }
+
+    pub fn init_repo(&mut self) {
+        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone(), r.has_git));
+        if let Some((name, Some(path), false)) = info {
+            self.set_status(format!("Initializing git repo in {}...", name));
+            let tx = self.task_tx.clone();
+            let op = format!("init {}", name);
+            tokio::spawn(async move {
+                let result = git::init(&path).await;
+                let _ = tx.send(TaskResult {
+                    success: result.success,
+                    message: if result.success {
+                        format!("Initialized git repo in {}", name)
+                    } else {
+                        "Git init failed (E: view errors)".to_string()
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
@@ -1844,6 +1869,7 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
                 parent_repo: repo.parent_repo,
                 fork_ahead: None,
                 fork_behind: None,
+                has_git: repo.has_git,
             });
         }
     }
@@ -1874,9 +1900,10 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             git_status: local.as_ref().map(|l| l.status.clone()),
             last_commit_time,
             is_subrepo: local.as_ref().map(|l| l.is_subrepo).unwrap_or(false),
-            parent_repo: local.and_then(|l| l.parent_repo),
+            parent_repo: local.as_ref().and_then(|l| l.parent_repo.clone()),
             fork_ahead: gh_repo.fork_ahead,
             fork_behind: gh_repo.fork_behind,
+            has_git: local.as_ref().map(|l| l.has_git).unwrap_or(true),
         });
     }
 
@@ -1900,6 +1927,7 @@ fn merge_repos(github_repos: Vec<github::GitHubRepoInfo>, local_repos: Vec<local
             parent_repo: repo.parent_repo,
             fork_ahead: None,
             fork_behind: None,
+            has_git: repo.has_git,
         });
     }
 
@@ -1959,7 +1987,7 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "d|Delete local copy|red".to_string(),
             "D|Delete remote repo|red".to_string(),
             "z|Reorganize to ghq path|".to_string(),
-            "i|Ignore/hide repo|".to_string(),
+            "i|Init git (nogit) / Ignore repo|".to_string(),
             "I|Show ignored repos|".to_string(),
             "".to_string(),
             "HEADER|Type Icons".to_string(),
@@ -1968,6 +1996,7 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "⑂|Fork (shows upstream)|magenta".to_string(),
             "◌ local|Local only (no remote)|blue".to_string(),
             "⊂ sub|Subrepo (nested in another)|yellow".to_string(),
+            "○ nogit|Folder without git repo|red".to_string(),
             "".to_string(),
             "HEADER|Status Icons".to_string(),
             "✓|Synced with remote|green".to_string(),

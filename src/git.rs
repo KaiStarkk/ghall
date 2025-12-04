@@ -241,6 +241,21 @@ pub async fn clone(url: &str, path: &str) -> GitOpResult {
     }
 }
 
+/// Initialize a git repository in the given directory
+pub async fn init(path: &str) -> GitOpResult {
+    let output = Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => GitOpResult::ok(),
+        Ok(out) => GitOpResult::err(String::from_utf8_lossy(&out.stderr).to_string()),
+        Err(e) => GitOpResult::err(e.to_string()),
+    }
+}
+
 /// Quicksync: fetch, ff-rebase, add all, commit with fixup, push
 pub async fn quicksync(path: &str) -> GitOpResult {
     let path = Path::new(path);

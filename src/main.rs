@@ -348,8 +348,17 @@ async fn handle_repos_action(app: &mut App, code: KeyCode) -> Result<Option<Stri
             }
         }
 
-        // Ignore/hide repo
-        KeyCode::Char('i') => app.toggle_ignore(),
+        // Init repo (if no git) or Ignore/hide repo
+        KeyCode::Char('i') => {
+            let is_nogit = app.get_selected_repo()
+                .map(|r| !r.has_git && r.has_local())
+                .unwrap_or(false);
+            if is_nogit {
+                app.init_repo();
+            } else {
+                app.toggle_ignore();
+            }
+        }
 
         // Show ignored repos popup
         KeyCode::Char('I') => app.show_ignored_popup(),

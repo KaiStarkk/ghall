@@ -256,6 +256,11 @@ fn format_repo_name(repo: &RepoRow) -> Span<'static> {
 }
 
 fn format_type(repo: &RepoRow) -> Line<'static> {
+    // Check if this is a non-git folder first (highest priority for visibility)
+    if !repo.has_git {
+        return Line::from(Span::styled("○ nogit", Style::default().fg(Color::Red)));
+    }
+
     // Check if this is a subrepo (nested inside another repo)
     if repo.is_subrepo {
         return Line::from(Span::styled("⊂ sub", Style::default().fg(Color::Yellow)));

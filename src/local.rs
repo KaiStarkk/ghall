@@ -13,6 +13,7 @@ pub struct LocalRepo {
     pub last_commit_time: Option<i64>,
     pub is_subrepo: bool,         // Nested inside another repo
     pub parent_repo: Option<String>, // Path to parent repo if subrepo
+    pub has_git: bool,            // Whether this folder has a git repo
 }
 
 pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
@@ -69,6 +70,7 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
                 last_commit_time,
                 is_subrepo: false,
                 parent_repo: None,
+                has_git: true,
             });
         }
     }
@@ -84,6 +86,65 @@ pub async fn discover_repos(root: &str) -> Result<Vec<LocalRepo>> {
                 repo.is_subrepo = true;
                 repo.parent_repo = Some(other_path.clone());
                 break; // Found the parent, no need to check more
+            }
+        }
+    }
+
+    // Scan for non-git folders in the "local" subdirectory
+    let local_dir = format!("{}/local", root);
+    if Path::new(&local_dir).is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&local_dir) {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.is_dir() {
+                        let path = entry.path();
+                        let path_str = path.to_string_lossy().to_string();
+
+                        // Check if this directory already has a git repo
+                        let git_dir = path.join(".git");
+                        let has_git_repo = git_dir.exists();
+
+                        // Skip if we already added it as a git repo
+                        if repos.iter().any(|r| r.path == path_str) {
+                            continue;
+                        }
+
+                        let folder_name = entry.file_name().to_string_lossy().to_string();
+
+                        if has_git_repo {
+                            // This is a git repo we missed in the walkdir (shouldn't happen, but be safe)
+                            let status = git::get_repo_status(&path_str).await.unwrap_or_default();
+                            let remote_url = git::get_remote_url(&path_str).await;
+                            let remote_owner = remote_url.as_ref().and_then(|url| parse_owner_from_url(url));
+                            let last_commit_time = git::get_last_commit_time(&path_str).await;
+
+                            repos.push(LocalRepo {
+                                name: folder_name,
+                                path: path_str,
+                                status,
+                                remote_owner,
+                                remote_url,
+                                last_commit_time,
+                                is_subrepo: false,
+                                parent_repo: None,
+                                has_git: true,
+                            });
+                        } else {
+                            // Non-git folder - add it with default/empty status
+                            repos.push(LocalRepo {
+                                name: folder_name,
+                                path: path_str,
+                                status: RepoStatus::default(),
+                                remote_owner: None,
+                                remote_url: None,
+                                last_commit_time: None,
+                                is_subrepo: false,
+                                parent_repo: None,
+                                has_git: false,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
