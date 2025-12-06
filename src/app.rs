@@ -381,6 +381,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub status_time: Option<Instant>,
     pub status_is_loading: bool, // true = show spinner, false = show tick
+    pub status_is_error: bool,   // true = show error (red, persistent)
     pub input_mode: InputMode,
     pub popup: Option<Popup>,
     pub input_buffer: String,
@@ -420,10 +421,24 @@ pub struct RefreshData {
     pub github_username: Option<String>,
     pub repos: Vec<RepoRow>,
     pub gists: Vec<GistRow>,
+    pub error: Option<String>, // Error message to display in status bar
 }
 
 /// Perform a full data refresh (runs in background task)
 async fn perform_refresh(local_root: String) -> RefreshData {
+    // Check gh authentication first
+    if let Err(e) = github::check_auth().await {
+        // Still discover local repos even without GitHub auth
+        let local_repos = local::discover_repos(&local_root).await.unwrap_or_default();
+        let repos = merge_repos(Vec::new(), local_repos);
+        return RefreshData {
+            github_username: None,
+            repos,
+            gists: Vec::new(),
+            error: Some(e.to_string()),
+        };
+    }
+
     // Fetch GitHub username
     let github_username = github::get_current_user().await.ok();
 
@@ -446,6 +461,7 @@ async fn perform_refresh(local_root: String) -> RefreshData {
         github_username,
         repos,
         gists,
+        error: None,
     }
 }
 
@@ -481,6 +497,7 @@ impl App {
             status_message: Some("Loading...".to_string()),
             status_time: Some(Instant::now()),
             status_is_loading: true,
+            status_is_error: false,
             input_mode: InputMode::Normal,
             popup: None,
             input_buffer: String::new(),
@@ -676,8 +693,9 @@ impl App {
                 self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
             }
 
-            // Clear status message after 2 seconds if not loading
-            if !self.status_is_loading {
+            // Clear status message after 2 seconds if not loading and not an error
+            // Error messages persist until user takes action
+            if !self.status_is_loading && !self.status_is_error {
                 if let Some(time) = self.status_time {
                     if time.elapsed().as_secs() >= 2 {
                         self.status_message = None;
@@ -737,7 +755,12 @@ impl App {
                 self.selected = max;
             }
 
-            self.set_status_completed(format!("Loaded {} repos", self.repos.len()));
+            // Show error if auth failed, otherwise show success
+            if let Some(error) = data.error {
+                self.set_status_error(error);
+            } else {
+                self.set_status_completed(format!("Loaded {} repos", self.repos.len()));
+            }
         }
     }
 
@@ -781,6 +804,15 @@ impl App {
         self.status_message = Some(msg.into());
         self.status_time = Some(Instant::now());
         self.status_is_loading = false;
+        self.status_is_error = false;
+    }
+
+    /// Set a status message for errors (shows X, persistent, red)
+    pub fn set_status_error(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_time = Some(Instant::now());
+        self.status_is_loading = false;
+        self.status_is_error = true;
     }
 
     /// Clear status message
@@ -789,6 +821,7 @@ impl App {
         self.status_message = None;
         self.status_time = None;
         self.status_is_loading = false;
+        self.status_is_error = false;
     }
 
     /// Toggle sort direction

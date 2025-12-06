@@ -546,17 +546,20 @@ fn shorten_path(path: &str) -> String {
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     // If there's a status message, show it on first line
     if let Some(ref msg) = app.status_message {
-        let (icon, icon_color) = if app.status_is_loading {
+        let (icon, icon_color, text_color) = if app.status_is_loading {
             // Show animated spinner for loading operations
-            (format!("{} ", app.spinner_char()), Color::Cyan)
+            (format!("{} ", app.spinner_char()), Color::Cyan, Color::Yellow)
+        } else if app.status_is_error {
+            // Show X mark for errors (persistent, red)
+            ("✗ ".to_string(), Color::Red, Color::Red)
         } else {
             // Show tick mark for completed operations
-            ("✓ ".to_string(), Color::Green)
+            ("✓ ".to_string(), Color::Green, Color::Yellow)
         };
 
         let status_line = Line::from(vec![
             Span::styled(icon, Style::default().fg(icon_color)),
-            Span::styled(msg.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled(msg.clone(), Style::default().fg(text_color)),
         ]);
         f.render_widget(Paragraph::new(status_line), area);
         return;

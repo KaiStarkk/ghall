@@ -478,6 +478,25 @@ pub async fn get_current_user() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Check if gh CLI is authenticated
+/// Returns Ok(()) if authenticated, Err with message if not
+pub async fn check_auth() -> Result<()> {
+    let output = Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not logged in") || stderr.contains("no oauth token") {
+            anyhow::bail!("gh not authenticated - run 'gh auth login'");
+        }
+        anyhow::bail!("gh auth check failed");
+    }
+
+    Ok(())
+}
+
 /// Compare response from GitHub API
 #[derive(Debug, Deserialize)]
 struct CompareResponse {
