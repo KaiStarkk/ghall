@@ -100,9 +100,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Resul
         app.poll_refresh();
 
         // Handle pending refresh from background tasks
+        // Full refresh takes precedence over local-only refresh
         if app.pending_refresh {
             app.pending_refresh = false;
+            app.pending_local_refresh = false; // Full refresh supersedes local
             app.trigger_refresh();
+        } else if app.pending_local_refresh {
+            app.pending_local_refresh = false;
+            app.trigger_local_refresh();
         }
 
         terminal.draw(|f| ui::draw(f, app))?;

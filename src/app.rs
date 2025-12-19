@@ -354,6 +354,12 @@ impl GistRow {
 /// Braille spinner frames
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Cached GitHub data to avoid re-fetching for local-only operations
+pub struct GitHubCache {
+    pub repos: Vec<github::GitHubRepoInfo>,
+    pub gists: Vec<GistRow>,
+}
+
 pub struct App {
     pub local_root: String,
     pub view_mode: ViewMode,
@@ -399,7 +405,11 @@ pub struct App {
     pub task_tx: mpsc::Sender<TaskResult>,
     pub refresh_rx: mpsc::Receiver<RefreshData>,
     pub refresh_tx: mpsc::Sender<RefreshData>,
-    pub pending_refresh: bool,
+    pub pending_refresh: bool,       // Full refresh (clears cache)
+    pub pending_local_refresh: bool, // Local-only refresh (uses cache)
+
+    // GitHub data cache (to avoid re-fetching for local-only operations)
+    pub github_cache: Option<GitHubCache>,
 
     // Upload form state
     pub upload_form: Option<UploadFormState>,
@@ -412,8 +422,9 @@ pub struct App {
 pub struct TaskResult {
     pub success: bool,
     pub message: String,
-    pub stderr: Option<String>, // Full stderr for error log
-    pub operation: String,      // Operation name for error log
+    pub stderr: Option<String>,          // Full stderr for error log
+    pub operation: String,               // Operation name for error log
+    pub invalidates_github_cache: bool,  // If true, needs full refresh; if false, local-only refresh
 }
 
 /// Data loaded from a refresh operation
@@ -421,7 +432,8 @@ pub struct RefreshData {
     pub github_username: Option<String>,
     pub repos: Vec<RepoRow>,
     pub gists: Vec<GistRow>,
-    pub error: Option<String>, // Error message to display in status bar
+    pub error: Option<String>,                      // Error message to display in status bar
+    pub github_cache: Option<GitHubCache>,          // Cache to store for local-only refreshes
 }
 
 /// Perform a full data refresh (runs in background task)
@@ -436,6 +448,7 @@ async fn perform_refresh(local_root: String) -> RefreshData {
             repos,
             gists: Vec::new(),
             error: Some(e.to_string()),
+            github_cache: None,
         };
     }
 
@@ -452,7 +465,7 @@ async fn perform_refresh(local_root: String) -> RefreshData {
     let local_repos = local::discover_repos(&local_root).await.unwrap_or_default();
 
     // Merge into unified list
-    let repos = merge_repos(github_repos, local_repos);
+    let repos = merge_repos(github_repos.clone(), local_repos);
 
     // Fetch gists
     let gists = github::fetch_gists_as_rows(&local_root).await.unwrap_or_default();
@@ -460,8 +473,29 @@ async fn perform_refresh(local_root: String) -> RefreshData {
     RefreshData {
         github_username,
         repos,
+        github_cache: Some(GitHubCache {
+            repos: github_repos,
+            gists: gists.clone(),
+        }),
         gists,
         error: None,
+    }
+}
+
+/// Perform a local-only refresh using cached GitHub data (runs in background task)
+async fn perform_local_refresh(local_root: String, cache: GitHubCache) -> RefreshData {
+    // Discover local repos
+    let local_repos = local::discover_repos(&local_root).await.unwrap_or_default();
+
+    // Merge with cached GitHub data
+    let repos = merge_repos(cache.repos.clone(), local_repos);
+
+    RefreshData {
+        github_username: None, // Keep existing, don't update
+        repos,
+        gists: cache.gists.clone(),
+        error: None,
+        github_cache: Some(cache), // Preserve the cache
     }
 }
 
@@ -510,6 +544,8 @@ impl App {
             refresh_rx,
             refresh_tx: refresh_tx.clone(),
             pending_refresh: false,
+            pending_local_refresh: false,
+            github_cache: None,
             upload_form: None,
             error_log: Vec::new(),
         };
@@ -529,9 +565,10 @@ impl App {
         repo.github_url.is_some() && repo.is_member
     }
 
-    /// Trigger a background refresh (non-blocking)
+    /// Trigger a full background refresh (non-blocking, clears cache)
     pub fn trigger_refresh(&mut self) {
         self.set_status("Refreshing...");
+        self.github_cache = None; // Clear cache for full refresh
         let local_root = self.local_root.clone();
         let tx = self.refresh_tx.clone();
 
@@ -539,6 +576,24 @@ impl App {
             let refresh_data = perform_refresh(local_root).await;
             let _ = tx.send(refresh_data).await;
         });
+    }
+
+    /// Trigger a local-only refresh using cached GitHub data (non-blocking)
+    /// Falls back to full refresh if no cache is available
+    pub fn trigger_local_refresh(&mut self) {
+        if let Some(cache) = self.github_cache.take() {
+            self.set_status("Updating...");
+            let local_root = self.local_root.clone();
+            let tx = self.refresh_tx.clone();
+
+            tokio::spawn(async move {
+                let refresh_data = perform_local_refresh(local_root, cache).await;
+                let _ = tx.send(refresh_data).await;
+            });
+        } else {
+            // No cache available, fall back to full refresh
+            self.trigger_refresh();
+        }
     }
 
     pub fn toggle_view_mode(&mut self) {
@@ -731,8 +786,14 @@ impl App {
             }
 
             // Set status as completed (will show tick instead of spinner)
-            self.set_status_completed(result.message);
-            self.pending_refresh = true;
+            self.set_status_completed(result.message.clone());
+
+            // Choose refresh type based on whether GitHub cache needs invalidation
+            if result.invalidates_github_cache {
+                self.pending_refresh = true;
+            } else {
+                self.pending_local_refresh = true;
+            }
         }
     }
 
@@ -745,6 +806,11 @@ impl App {
             }
             self.repos = data.repos;
             self.gists = data.gists;
+
+            // Store GitHub cache for local-only refreshes
+            if data.github_cache.is_some() {
+                self.github_cache = data.github_cache;
+            }
 
             // Re-apply user's sort settings
             self.sort_repos();
@@ -1118,6 +1184,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1140,6 +1207,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1174,6 +1242,7 @@ impl App {
                     },
                     stderr,
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1197,6 +1266,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1227,6 +1297,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Clone creates local copy, doesn't change GitHub
                 }).await;
             });
         }
@@ -1249,6 +1320,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local filesystem operation
                 }).await;
             });
         }
@@ -1294,6 +1366,7 @@ impl App {
                         },
                         stderr: result.err().map(|e| e.to_string()),
                         operation: op,
+                        invalidates_github_cache: false, // Local filesystem operation
                     }).await;
                 });
                 self.close_popup();
@@ -1325,6 +1398,7 @@ impl App {
                         },
                         stderr: Some(result.stderr),
                         operation: op,
+                        invalidates_github_cache: true, // Remote repo deleted from GitHub
                     }).await;
                 });
                 self.close_popup();
@@ -1419,6 +1493,7 @@ impl App {
                     },
                     stderr: result.err().map(|e| e.to_string()),
                     operation: op,
+                    invalidates_github_cache: false, // Local filesystem operation
                 }).await;
             });
         }
@@ -1450,6 +1525,7 @@ impl App {
                             message: "Failed to unarchive before visibility change (E: view errors)".to_string(),
                             stderr: Some(unarchive_result.stderr),
                             operation: op,
+                            invalidates_github_cache: true, // GitHub state may have changed
                         }).await;
                         return;
                     }
@@ -1479,6 +1555,7 @@ impl App {
                     message,
                     stderr,
                     operation: op,
+                    invalidates_github_cache: true, // GitHub visibility/archive state changed
                 }).await;
             });
         }
@@ -1510,6 +1587,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: true, // GitHub archive state changed
                 }).await;
             });
         }
@@ -1541,6 +1619,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Clone creates local copy, doesn't change GitHub
                 }).await;
             });
         }
@@ -1574,6 +1653,7 @@ impl App {
                         },
                         stderr: Some(result.stderr),
                         operation: op,
+                        invalidates_github_cache: true, // Gist deleted from GitHub
                     }).await;
                 });
                 self.close_popup();
@@ -1604,6 +1684,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1629,6 +1710,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1666,6 +1748,7 @@ impl App {
                     },
                     stderr,
                     operation: op,
+                    invalidates_github_cache: false, // Local git operation
                 }).await;
             });
         }
@@ -1691,6 +1774,7 @@ impl App {
                     message: format!("__ORGS__:{}", orgs.join(",")),
                     stderr: None,
                     operation: String::new(),
+                    invalidates_github_cache: false, // Not a real operation, just data fetch
                 }).await;
             });
 
@@ -1740,6 +1824,7 @@ impl App {
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
+                    invalidates_github_cache: true, // New repo created on GitHub
                 }).await;
             });
 
