@@ -3,7 +3,7 @@ use crate::git::RepoStatus;
 use crate::{git, github, local};
 use anyhow::Result;
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -380,6 +380,9 @@ pub struct App {
     pub show_archived: bool,
     pub show_private: bool,
 
+    // Marked items for batch operations (stores repo/gist IDs)
+    pub marked: HashSet<String>,
+
     // Column selection for reordering (index into visible columns)
     pub selected_column: usize,
 
@@ -527,6 +530,7 @@ impl App {
             sort_ascending,
             show_archived,
             show_private,
+            marked: HashSet::new(),
             selected_column: 0,
             status_message: Some("Loading...".to_string()),
             status_time: Some(Instant::now()),
@@ -738,6 +742,45 @@ impl App {
 
     pub fn previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Toggle mark on currently selected item
+    pub fn toggle_mark(&mut self) {
+        let id = match self.view_mode {
+            ViewMode::Repos => self.visible_repos().get(self.selected).map(|r| r.id.clone()),
+            ViewMode::Gists => self.gists.get(self.selected).map(|g| g.id.clone()),
+        };
+        if let Some(id) = id {
+            if self.marked.contains(&id) {
+                self.marked.remove(&id);
+            } else {
+                self.marked.insert(id);
+            }
+        }
+    }
+
+    /// Check if item is marked
+    pub fn is_marked(&self, id: &str) -> bool {
+        self.marked.contains(id)
+    }
+
+    /// Clear all marks
+    pub fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    /// Get count of marked items
+    pub fn marked_count(&self) -> usize {
+        self.marked.len()
+    }
+
+    /// Get marked repos that have local paths (for batch operations)
+    pub fn marked_local_repos(&self) -> Vec<(String, String)> {
+        self.repos
+            .iter()
+            .filter(|r| self.marked.contains(&r.id) && r.local_path.is_some())
+            .map(|r| (r.name.clone(), r.local_path.clone().unwrap()))
+            .collect()
     }
 
     /// Advance the spinner frame and check for status message timeout
@@ -1250,25 +1293,67 @@ impl App {
 
     /// Quicksync: fetch, ff-rebase, add all, commit with fixup, push
     pub fn quicksync_selected(&mut self) {
-        let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
-        if let Some((name, Some(path))) = info {
-            self.set_status(format!("Quicksyncing {}...", name));
+        // If marked repos exist, quicksync all of them
+        let marked = self.marked_local_repos();
+        if !marked.is_empty() {
+            let count = marked.len();
+            self.set_status(format!("Quicksyncing {} repos...", count));
             let tx = self.task_tx.clone();
-            let op = format!("quicksync {}", name);
             tokio::spawn(async move {
-                let result = git::quicksync(&path).await;
-                let _ = tx.send(TaskResult {
-                    success: result.success,
-                    message: if result.success {
-                        format!("Quicksynced {}", name)
+                let mut success_count = 0;
+                let mut fail_count = 0;
+                let mut errors = Vec::new();
+                for (name, path) in marked {
+                    let result = git::quicksync(&path).await;
+                    if result.success {
+                        success_count += 1;
                     } else {
+<<<<<<< Updated upstream
                         "Quicksync failed (E: view errors)".to_string()
                     },
                     stderr: if result.success { None } else { Some(result.stderr) },
                     operation: op,
                     invalidates_github_cache: false, // Local git operation
+=======
+                        fail_count += 1;
+                        errors.push(format!("{}: {}", name, result.stderr));
+                    }
+                }
+                let msg = if fail_count == 0 {
+                    format!("Quicksynced {} repos", success_count)
+                } else {
+                    format!("Quicksynced {}/{} (E: view errors)", success_count, success_count + fail_count)
+                };
+                let _ = tx.send(TaskResult {
+                    success: fail_count == 0,
+                    message: msg,
+                    stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
+                    operation: format!("quicksync {} repos", count),
+>>>>>>> Stashed changes
                 }).await;
             });
+            self.clear_marks();
+        } else {
+            // Single repo quicksync
+            let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+            if let Some((name, Some(path))) = info {
+                self.set_status(format!("Quicksyncing {}...", name));
+                let tx = self.task_tx.clone();
+                let op = format!("quicksync {}", name);
+                tokio::spawn(async move {
+                    let result = git::quicksync(&path).await;
+                    let _ = tx.send(TaskResult {
+                        success: result.success,
+                        message: if result.success {
+                            format!("Quicksynced {}", name)
+                        } else {
+                            "Quicksync failed (E: view errors)".to_string()
+                        },
+                        stderr: if result.success { None } else { Some(result.stderr) },
+                        operation: op,
+                    }).await;
+                });
+            }
         }
     }
 
@@ -1327,10 +1412,12 @@ impl App {
     }
 
     pub fn start_delete_confirm(&mut self) {
+        // Allow delete if either marked items exist or selected item has local
+        let has_marked = !self.marked_local_repos().is_empty();
         let has_local = self.get_selected_repo()
             .map(|r| r.has_local())
             .unwrap_or(false);
-        if has_local {
+        if has_marked || has_local {
             self.input_mode = InputMode::ConfirmDelete;
             self.pending_delete = Some(DeleteType::LocalRepo);
             self.confirm_buffer.clear();
@@ -1350,26 +1437,69 @@ impl App {
 
     pub fn delete_local_repo(&mut self) {
         if self.confirm_buffer.to_lowercase() == "y" || self.confirm_buffer.to_lowercase() == "yes" {
-            let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
-            if let Some((name, Some(path))) = info {
-                self.set_status(format!("Deleting {}...", name));
+            // Check if we're deleting marked items
+            let marked = self.marked_local_repos();
+            if !marked.is_empty() {
+                let count = marked.len();
+                self.set_status(format!("Deleting {} repos...", count));
                 let tx = self.task_tx.clone();
-                let op = format!("delete local {}", name);
                 tokio::spawn(async move {
-                    let result = tokio::fs::remove_dir_all(&path).await;
-                    let _ = tx.send(TaskResult {
-                        success: result.is_ok(),
-                        message: if result.is_ok() {
-                            format!("Deleted {}", name)
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+                    let mut errors = Vec::new();
+                    for (name, path) in marked {
+                        let result = tokio::fs::remove_dir_all(&path).await;
+                        if result.is_ok() {
+                            success_count += 1;
                         } else {
+<<<<<<< Updated upstream
                             format!("Failed to delete {}", name)
                         },
                         stderr: result.err().map(|e| e.to_string()),
                         operation: op,
                         invalidates_github_cache: false, // Local filesystem operation
+=======
+                            fail_count += 1;
+                            errors.push(format!("{}: {}", name, result.err().unwrap()));
+                        }
+                    }
+                    let msg = if fail_count == 0 {
+                        format!("Deleted {} repos", success_count)
+                    } else {
+                        format!("Deleted {}/{} (E: view errors)", success_count, success_count + fail_count)
+                    };
+                    let _ = tx.send(TaskResult {
+                        success: fail_count == 0,
+                        message: msg,
+                        stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
+                        operation: format!("delete {} repos", count),
+>>>>>>> Stashed changes
                     }).await;
                 });
+                self.clear_marks();
                 self.close_popup();
+            } else {
+                // Single repo delete
+                let info = self.get_selected_repo().map(|r| (r.name.clone(), r.local_path.clone()));
+                if let Some((name, Some(path))) = info {
+                    self.set_status(format!("Deleting {}...", name));
+                    let tx = self.task_tx.clone();
+                    let op = format!("delete local {}", name);
+                    tokio::spawn(async move {
+                        let result = tokio::fs::remove_dir_all(&path).await;
+                        let _ = tx.send(TaskResult {
+                            success: result.is_ok(),
+                            message: if result.is_ok() {
+                                format!("Deleted {}", name)
+                            } else {
+                                format!("Failed to delete {}", name)
+                            },
+                            stderr: result.err().map(|e| e.to_string()),
+                            operation: op,
+                        }).await;
+                    });
+                    self.close_popup();
+                }
             }
         } else {
             self.close_popup();
@@ -2093,6 +2223,11 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "y|Quicksync (rebase+add+commit+push)|yellow".to_string(),
             "r|Refresh all|".to_string(),
             "".to_string(),
+            "HEADER|Batch Operations".to_string(),
+            "x|Mark/unmark for batch ops|magenta".to_string(),
+            "X|Clear all marks|".to_string(),
+            "|Marked items: y=quicksync, d=delete|".to_string(),
+            "".to_string(),
             "HEADER|Repository".to_string(),
             "n|Clone repo (remote-only)|cyan".to_string(),
             "u|Upload local repo to GitHub|magenta".to_string(),
@@ -2141,6 +2276,10 @@ pub fn get_help_content(view_mode: &ViewMode) -> Vec<String> {
             "HEADER|Gist Actions".to_string(),
             "n|Clone gist locally|cyan".to_string(),
             "d|Delete gist from GitHub|red".to_string(),
+            "".to_string(),
+            "HEADER|Batch Operations".to_string(),
+            "x|Mark/unmark for batch ops|magenta".to_string(),
+            "X|Clear all marks|".to_string(),
             "".to_string(),
             "|Press ? or Esc to close|".to_string(),
         ],

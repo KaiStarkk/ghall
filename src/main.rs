@@ -230,6 +230,12 @@ async fn handle_normal_mode<B: Backend>(terminal: &mut Terminal<B>, app: &mut Ap
         // Toggle show private (capital P)
         KeyCode::Char('P') => app.toggle_show_private(),
 
+        // Mark/unmark item for batch operations
+        KeyCode::Char('x') => app.toggle_mark(),
+
+        // Clear all marks
+        KeyCode::Char('X') => app.clear_marks(),
+
         // Mode-specific actions
         _ => {
             match app.view_mode {

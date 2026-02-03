@@ -123,15 +123,20 @@ fn draw_repos_table(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(idx, repo)| {
             let is_selected = idx == app.selected;
-            let row_style = if is_selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
+            let is_marked = app.is_marked(&repo.id);
+            let row_style = match (is_selected, is_marked) {
+                (true, true) => Style::default().bg(Color::Magenta),
+                (true, false) => Style::default().bg(Color::DarkGray),
+                (false, true) => Style::default().fg(Color::Magenta),
+                (false, false) => Style::default(),
             };
 
             let cells: Vec<Cell> = columns.iter().map(|col| {
                 match col {
-                    Column::Origin => Cell::from(format_origin(repo)),
+                    Column::Origin => {
+                        let mark = if is_marked { "*" } else { "" };
+                        Cell::from(format!("{}{}", mark, format_origin(repo)))
+                    }
                     Column::Repository => Cell::from(format_repo_name(repo)),
                     Column::Type => Cell::from(format_type(repo)),
                     Column::Updated => Cell::from(format_updated(repo)),
@@ -199,14 +204,24 @@ fn draw_gists_table(f: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(idx, gist)| {
             let is_selected = idx == app.selected;
-            let row_style = if is_selected {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
+            let is_marked = app.is_marked(&gist.id);
+            let row_style = match (is_selected, is_marked) {
+                (true, true) => Style::default().bg(Color::Magenta),
+                (true, false) => Style::default().bg(Color::DarkGray),
+                (false, true) => Style::default().fg(Color::Magenta),
+                (false, false) => Style::default(),
             };
 
+            let desc_cell = if is_marked {
+                Cell::from(Line::from(vec![
+                    Span::styled("*", Style::default().fg(Color::Magenta)),
+                    format_gist_description(gist),
+                ]))
+            } else {
+                Cell::from(format_gist_description(gist))
+            };
             Row::new(vec![
-                Cell::from(format_gist_description(gist)),
+                desc_cell,
                 Cell::from(format!("{}", gist.file_names.len())),
                 Cell::from(if gist.is_public { "✓" } else { "" }),
                 Cell::from(format_gist_dirty(gist)),
@@ -612,12 +627,14 @@ fn build_repos_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
     let has_github = repo.map(|r| r.github_url.is_some()).unwrap_or(false);
     let needs_ghq = repo.map(|r| r.follows_ghq(&app.local_root) == Some(false)).unwrap_or(false);
 
-    // Error indicator
-    let mut spans1: Vec<Span> = if app.error_count() > 0 {
-        vec![Span::styled(format!("[{}err] ", app.error_count()), Style::default().fg(Color::Red))]
-    } else {
-        vec![]
-    };
+    // Error indicator and mark count
+    let mut spans1: Vec<Span> = vec![];
+    if app.error_count() > 0 {
+        spans1.push(Span::styled(format!("[{}err] ", app.error_count()), Style::default().fg(Color::Red)));
+    }
+    if app.marked_count() > 0 {
+        spans1.push(Span::styled(format!("[{}✓] ", app.marked_count()), Style::default().fg(Color::Magenta)));
+    }
 
     // Line 1: Navigation + Git operations
     spans1.extend(hotkey("↑↓", "nav", true));
@@ -644,6 +661,7 @@ fn build_repos_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
     spans2.extend(hotkey("A", "arch", true));
     spans2.extend(hotkey("P", "priv", true));
     spans2.extend(hotkey("i", "hide", true));
+    spans2.extend(hotkey("x", "mark", true));
     spans2.extend(hotkey("r", "ref", true));
     spans2.extend(hotkey("?", "help", true));
 
@@ -657,7 +675,11 @@ fn build_gists_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
     let is_remote_only = gist.map(|g| g.local_path.is_none()).unwrap_or(false);
     let is_dirty = gist.map(|g| g.is_dirty()).unwrap_or(false);
 
+    // Mark count indicator
     let mut spans1: Vec<Span> = vec![];
+    if app.marked_count() > 0 {
+        spans1.push(Span::styled(format!("[{}✓] ", app.marked_count()), Style::default().fg(Color::Magenta)));
+    }
     spans1.extend(hotkey("↑↓", "nav", true));
     spans1.extend(hotkey("Enter", "details", true));
     spans1.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
@@ -668,6 +690,7 @@ fn build_gists_hotkeys(app: &App) -> (Line<'static>, Line<'static>) {
 
     let mut spans2: Vec<Span> = vec![];
     spans2.extend(hotkey("d", "delete", true));
+    spans2.extend(hotkey("x", "mark", true));
     spans2.extend(hotkey("r", "refresh", true));
     spans2.extend(hotkey("Tab", "repos", true));
     spans2.extend(hotkey("?", "help", true));
@@ -814,20 +837,30 @@ fn draw_confirm_delete_popup(f: &mut Frame, app: &App) {
     let area = centered_rect(50, 25, f.area());
     f.render_widget(Clear, area);
 
-    let (title, warning_text) = match app.pending_delete {
-        Some(DeleteType::LocalRepo) => (
-            " Confirm Delete Local ",
-            "Type 'y' or 'yes' to delete this repository locally:",
-        ),
+    let marked_count = app.marked_local_repos().len();
+    let (title, warning_text): (&str, String) = match app.pending_delete {
+        Some(DeleteType::LocalRepo) => {
+            if marked_count > 0 {
+                (
+                    " Confirm Delete Marked ",
+                    format!("Type 'y' or 'yes' to delete {} repositories locally:", marked_count),
+                )
+            } else {
+                (
+                    " Confirm Delete Local ",
+                    "Type 'y' or 'yes' to delete this repository locally:".to_string(),
+                )
+            }
+        }
         Some(DeleteType::RemoteRepo) => (
             " Confirm Delete Remote ",
-            "Type 'y' or 'yes' to DELETE THIS REPO FROM GITHUB:",
+            "Type 'y' or 'yes' to DELETE THIS REPO FROM GITHUB:".to_string(),
         ),
         Some(DeleteType::Gist) => (
             " Confirm Delete Gist ",
-            "Type 'y' or 'yes' to delete this gist from GitHub:",
+            "Type 'y' or 'yes' to delete this gist from GitHub:".to_string(),
         ),
-        None => (" Confirm Delete ", "Type 'y' or 'yes' to confirm:"),
+        None => (" Confirm Delete ", "Type 'y' or 'yes' to confirm:".to_string()),
     };
 
     let block = Block::default()
