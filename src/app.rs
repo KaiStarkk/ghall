@@ -1322,6 +1322,7 @@ impl App {
                     message: msg,
                     stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
                     operation: format!("quicksync {} repos", count),
+                    invalidates_github_cache: false,
                 }).await;
             });
             self.clear_marks();
@@ -1343,6 +1344,7 @@ impl App {
                         },
                         stderr: if result.success { None } else { Some(result.stderr) },
                         operation: op,
+                        invalidates_github_cache: false,
                     }).await;
                 });
             }
@@ -1458,6 +1460,7 @@ impl App {
                         message: msg,
                         stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
                         operation: format!("delete {} repos", count),
+                        invalidates_github_cache: false,
                     }).await;
                 });
                 self.clear_marks();
@@ -1480,6 +1483,7 @@ impl App {
                             },
                             stderr: result.err().map(|e| e.to_string()),
                             operation: op,
+                            invalidates_github_cache: false,
                         }).await;
                     });
                     self.close_popup();
