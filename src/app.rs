@@ -1308,13 +1308,6 @@ impl App {
                     if result.success {
                         success_count += 1;
                     } else {
-<<<<<<< Updated upstream
-                        "Quicksync failed (E: view errors)".to_string()
-                    },
-                    stderr: if result.success { None } else { Some(result.stderr) },
-                    operation: op,
-                    invalidates_github_cache: false, // Local git operation
-=======
                         fail_count += 1;
                         errors.push(format!("{}: {}", name, result.stderr));
                     }
@@ -1329,7 +1322,6 @@ impl App {
                     message: msg,
                     stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
                     operation: format!("quicksync {} repos", count),
->>>>>>> Stashed changes
                 }).await;
             });
             self.clear_marks();
@@ -1452,13 +1444,6 @@ impl App {
                         if result.is_ok() {
                             success_count += 1;
                         } else {
-<<<<<<< Updated upstream
-                            format!("Failed to delete {}", name)
-                        },
-                        stderr: result.err().map(|e| e.to_string()),
-                        operation: op,
-                        invalidates_github_cache: false, // Local filesystem operation
-=======
                             fail_count += 1;
                             errors.push(format!("{}: {}", name, result.err().unwrap()));
                         }
@@ -1473,7 +1458,6 @@ impl App {
                         message: msg,
                         stderr: if errors.is_empty() { None } else { Some(errors.join("\n")) },
                         operation: format!("delete {} repos", count),
->>>>>>> Stashed changes
                     }).await;
                 });
                 self.clear_marks();
